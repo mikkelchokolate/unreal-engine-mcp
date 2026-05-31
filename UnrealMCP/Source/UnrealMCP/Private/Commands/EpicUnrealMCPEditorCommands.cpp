@@ -596,6 +596,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     else if (CommandType == TEXT("set_actor_transform")) { return HandleSetActorTransform(Params); }
     else if (CommandType == TEXT("execute_unreal_python")) { return HandleExecuteUnrealPython(Params); }
     else if (CommandType == TEXT("export_retargeted_animations")) { return HandleExportRetargetedAnimations(Params); }
+    else if (CommandType == TEXT("list_animation_assets")) { return HandleListAnimationAssets(Params); }
     else if (CommandType == TEXT("spawn_blueprint_actor")) { return HandleSpawnBlueprintActor(Params); }
     // Editor lifecycle
     else if (CommandType == TEXT("request_editor_exit")) { return HandleRequestEditorExit(Params); }
@@ -902,6 +903,101 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExecuteUnrealPython(
         ResultObj->SetStringField(TEXT("error"), PythonCommand.CommandResult);
         ResultObj->SetStringField(TEXT("error_code"), MCPErrorCodes::UNKNOWN_ERROR);
     }
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleListAnimationAssets(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SearchPath = TEXT("/Game/");
+    bool bRecursive = true;
+    int32 Limit = 500;
+
+    TArray<FString> ClassNames;
+    if (Params.IsValid())
+    {
+        Params->TryGetStringField(TEXT("search_path"), SearchPath);
+        Params->TryGetBoolField(TEXT("recursive"), bRecursive);
+
+        double LimitNumber = 0.0;
+        if (Params->TryGetNumberField(TEXT("limit"), LimitNumber))
+        {
+            Limit = FMath::Max(0, static_cast<int32>(LimitNumber));
+        }
+
+        const TArray<TSharedPtr<FJsonValue>>* ClassNameValues = nullptr;
+        if (Params->TryGetArrayField(TEXT("class_names"), ClassNameValues) && ClassNameValues)
+        {
+            for (const TSharedPtr<FJsonValue>& Value : *ClassNameValues)
+            {
+                if (Value.IsValid())
+                {
+                    ClassNames.Add(Value->AsString());
+                }
+            }
+        }
+    }
+
+    if (!SearchPath.StartsWith(TEXT("/")))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::INVALID_PARAM, TEXT("search_path must be an Unreal content path such as /Game/"));
+    }
+
+    const TArray<FString> AssetPaths = UEditorAssetLibrary::ListAssets(SearchPath, bRecursive, false);
+    TArray<TSharedPtr<FJsonValue>> Assets;
+
+    auto IsWantedClass = [&ClassNames](const FString& ClassName) -> bool
+    {
+        if (ClassNames.Num() > 0)
+        {
+            for (const FString& RequestedClass : ClassNames)
+            {
+                if (ClassName.Equals(RequestedClass, ESearchCase::IgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        return ClassName.Equals(TEXT("SkeletalMesh"), ESearchCase::IgnoreCase) ||
+               ClassName.Equals(TEXT("AnimSequence"), ESearchCase::IgnoreCase) ||
+               ClassName.Equals(TEXT("IKRetargeter"), ESearchCase::IgnoreCase) ||
+               ClassName.Equals(TEXT("IKRigDefinition"), ESearchCase::IgnoreCase);
+    };
+
+    for (const FString& AssetPath : AssetPaths)
+    {
+        if (Limit > 0 && Assets.Num() >= Limit)
+        {
+            break;
+        }
+
+        UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
+        if (!Asset)
+        {
+            continue;
+        }
+
+        const FString ClassName = Asset->GetClass() ? Asset->GetClass()->GetName() : TEXT("");
+        if (!IsWantedClass(ClassName))
+        {
+            continue;
+        }
+
+        TSharedPtr<FJsonObject> AssetObj = MakeShared<FJsonObject>();
+        AssetObj->SetStringField(TEXT("name"), Asset->GetName());
+        AssetObj->SetStringField(TEXT("path"), Asset->GetPathName());
+        AssetObj->SetStringField(TEXT("package_path"), AssetPath);
+        AssetObj->SetStringField(TEXT("class"), ClassName);
+        Assets.Add(MakeShared<FJsonValueObject>(AssetObj));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetArrayField(TEXT("assets"), Assets);
+    ResultObj->SetNumberField(TEXT("count"), Assets.Num());
+    ResultObj->SetStringField(TEXT("search_path"), SearchPath);
+    ResultObj->SetBoolField(TEXT("recursive"), bRecursive);
     return ResultObj;
 }
 

@@ -539,6 +539,41 @@ def export_retargeted_animations(config_path: str, script_path: str, args_json: 
 
 
 @mcp.tool()
+def list_animation_assets(
+    search_path: str = "/Game/",
+    recursive: bool = True,
+    class_names: Optional[List[str]] = None,
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """
+    List animation-pipeline assets in the connected Unreal Editor project.
+
+    Args:
+        search_path: Unreal content path to scan, such as /Game/.
+        recursive: Whether to scan child folders.
+        class_names: Optional class-name filter, e.g. ["SkeletalMesh", "AnimSequence"].
+        limit: Maximum number of matching assets to return.
+    """
+    unreal = get_unreal_connection()
+    if not unreal:
+        return make_error_response(MCPErrorCode.CONNECTION_ERROR, "Failed to connect to Unreal Engine")
+
+    try:
+        params: Dict[str, Any] = {
+            "search_path": search_path,
+            "recursive": recursive,
+            "limit": limit,
+        }
+        if class_names is not None:
+            params["class_names"] = class_names
+        response = unreal.send_command("list_animation_assets", params)
+        return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
+    except Exception as e:
+        logger.error(f"list_animation_assets error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
+@mcp.tool()
 def get_actors_in_level(random_string: str = "") -> Dict[str, Any]:
     """Get a list of all actors in the current level."""
     unreal = get_unreal_connection()
