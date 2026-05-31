@@ -25,6 +25,7 @@ private:
     TSharedPtr<FJsonObject> HandleSetActorTransform(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleExecuteUnrealPython(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleExportRetargetedAnimations(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleValidateAnimationExportConfig(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleListAnimationAssets(const TSharedPtr<FJsonObject>& Params);
 
     // Blueprint actor spawning

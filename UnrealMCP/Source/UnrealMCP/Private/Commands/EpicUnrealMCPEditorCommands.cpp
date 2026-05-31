@@ -42,6 +42,7 @@
 #include "Slate/SceneViewport.h"
 #include "IPythonScriptPlugin.h"
 #include "Misc/Base64.h"
+#include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 
@@ -596,6 +597,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     else if (CommandType == TEXT("set_actor_transform")) { return HandleSetActorTransform(Params); }
     else if (CommandType == TEXT("execute_unreal_python")) { return HandleExecuteUnrealPython(Params); }
     else if (CommandType == TEXT("export_retargeted_animations")) { return HandleExportRetargetedAnimations(Params); }
+    else if (CommandType == TEXT("validate_animation_export_config")) { return HandleValidateAnimationExportConfig(Params); }
     else if (CommandType == TEXT("list_animation_assets")) { return HandleListAnimationAssets(Params); }
     else if (CommandType == TEXT("spawn_blueprint_actor")) { return HandleSpawnBlueprintActor(Params); }
     // Editor lifecycle
@@ -903,6 +905,161 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExecuteUnrealPython(
         ResultObj->SetStringField(TEXT("error"), PythonCommand.CommandResult);
         ResultObj->SetStringField(TEXT("error_code"), MCPErrorCodes::UNKNOWN_ERROR);
     }
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleValidateAnimationExportConfig(const TSharedPtr<FJsonObject>& Params)
+{
+    FString ConfigPath;
+    if (!Params.IsValid() || (!Params->TryGetStringField(TEXT("config_path"), ConfigPath) &&
+                              !Params->TryGetStringField(TEXT("configPath"), ConfigPath)))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'config_path' parameter"));
+    }
+
+    FString ConfigJson;
+    if (!FFileHelper::LoadFileToString(ConfigJson, *ConfigPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::NOT_FOUND,
+            FString::Printf(TEXT("Failed to read animation export config: %s"), *ConfigPath));
+    }
+
+    TSharedPtr<FJsonObject> Config;
+    TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(ConfigJson);
+    if (!FJsonSerializer::Deserialize(Reader, Config) || !Config.IsValid())
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::INVALID_PARAM,
+            FString::Printf(TEXT("Animation export config is not valid JSON: %s"), *ConfigPath));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> MissingConfigKeys;
+    auto RequireField = [&Config, &MissingConfigKeys](const FString& FieldName)
+    {
+        if (!Config->HasField(FieldName))
+        {
+            MissingConfigKeys.Add(MakeShared<FJsonValueString>(FieldName));
+        }
+    };
+
+    RequireField(TEXT("source_mesh"));
+    RequireField(TEXT("target_mesh"));
+    RequireField(TEXT("ik_retargeter"));
+    RequireField(TEXT("source_animation_paths"));
+    RequireField(TEXT("retarget_output_path"));
+    RequireField(TEXT("fbx_output_dir"));
+    RequireField(TEXT("licenseClass"));
+    RequireField(TEXT("sourceId"));
+    RequireField(TEXT("clipKind"));
+    RequireField(TEXT("loop"));
+
+    const TArray<TSharedPtr<FJsonValue>>* SourceAnimationValues = nullptr;
+    if (!Config->TryGetArrayField(TEXT("source_animation_paths"), SourceAnimationValues) ||
+        !SourceAnimationValues ||
+        SourceAnimationValues->Num() == 0)
+    {
+        MissingConfigKeys.Add(MakeShared<FJsonValueString>(TEXT("source_animation_paths")));
+    }
+
+    FString LicenseClass;
+    Config->TryGetStringField(TEXT("licenseClass"), LicenseClass);
+    const bool bBlockedLicense = LicenseClass.Equals(TEXT("ue_only_blocked"), ESearchCase::IgnoreCase);
+
+    TArray<TSharedPtr<FJsonValue>> AvailableAssets;
+    TArray<TSharedPtr<FJsonValue>> MissingAssets;
+
+    auto TryLoadAssetWithExpandedPath = [](const FString& AssetPath) -> UObject*
+    {
+        UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
+        if (!Asset && AssetPath.StartsWith(TEXT("/")) && !AssetPath.Contains(TEXT(".")))
+        {
+            const FString AssetName = FPaths::GetBaseFilename(AssetPath);
+            const FString ExpandedPath = FString::Printf(TEXT("%s.%s"), *AssetPath, *AssetName);
+            Asset = UEditorAssetLibrary::LoadAsset(ExpandedPath);
+        }
+        return Asset;
+    };
+
+    auto CheckAsset = [&AvailableAssets, &MissingAssets, &TryLoadAssetWithExpandedPath](const FString& Label, const FString& AssetPath)
+    {
+        if (AssetPath.IsEmpty())
+        {
+            TSharedPtr<FJsonObject> MissingObj = MakeShared<FJsonObject>();
+            MissingObj->SetStringField(TEXT("label"), Label);
+            MissingObj->SetStringField(TEXT("path"), AssetPath);
+            MissingObj->SetStringField(TEXT("reason"), TEXT("empty_path"));
+            MissingAssets.Add(MakeShared<FJsonValueObject>(MissingObj));
+            return;
+        }
+
+        UObject* Asset = TryLoadAssetWithExpandedPath(AssetPath);
+        TSharedPtr<FJsonObject> AssetObj = MakeShared<FJsonObject>();
+        AssetObj->SetStringField(TEXT("label"), Label);
+        AssetObj->SetStringField(TEXT("path"), AssetPath);
+
+        if (Asset)
+        {
+            AssetObj->SetStringField(TEXT("name"), Asset->GetName());
+            AssetObj->SetStringField(TEXT("resolved_path"), Asset->GetPathName());
+            AssetObj->SetStringField(TEXT("class"), Asset->GetClass() ? Asset->GetClass()->GetName() : TEXT(""));
+            AvailableAssets.Add(MakeShared<FJsonValueObject>(AssetObj));
+        }
+        else
+        {
+            AssetObj->SetStringField(TEXT("reason"), TEXT("not_found"));
+            MissingAssets.Add(MakeShared<FJsonValueObject>(AssetObj));
+        }
+    };
+
+    FString SourceMeshPath;
+    if (Config->TryGetStringField(TEXT("source_mesh"), SourceMeshPath))
+    {
+        CheckAsset(TEXT("source_mesh"), SourceMeshPath);
+    }
+
+    FString TargetMeshPath;
+    if (Config->TryGetStringField(TEXT("target_mesh"), TargetMeshPath))
+    {
+        CheckAsset(TEXT("target_mesh"), TargetMeshPath);
+    }
+
+    FString RetargeterPath;
+    if (Config->TryGetStringField(TEXT("ik_retargeter"), RetargeterPath))
+    {
+        CheckAsset(TEXT("ik_retargeter"), RetargeterPath);
+    }
+
+    if (SourceAnimationValues)
+    {
+        for (int32 Index = 0; Index < SourceAnimationValues->Num(); ++Index)
+        {
+            const TSharedPtr<FJsonValue>& Value = (*SourceAnimationValues)[Index];
+            if (!Value.IsValid() || Value->Type != EJson::String)
+            {
+                MissingConfigKeys.Add(MakeShared<FJsonValueString>(
+                    FString::Printf(TEXT("source_animation_paths[%d]"), Index)));
+                continue;
+            }
+            CheckAsset(FString::Printf(TEXT("source_animation_paths[%d]"), Index), Value->AsString());
+        }
+    }
+
+    const bool bValid = MissingConfigKeys.Num() == 0 && MissingAssets.Num() == 0 && !bBlockedLicense;
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetBoolField(TEXT("valid"), bValid);
+    ResultObj->SetStringField(TEXT("config_path"), ConfigPath);
+    ResultObj->SetArrayField(TEXT("missing_config_keys"), MissingConfigKeys);
+    ResultObj->SetArrayField(TEXT("missing_assets"), MissingAssets);
+    ResultObj->SetArrayField(TEXT("available_assets"), AvailableAssets);
+    ResultObj->SetBoolField(TEXT("blocked_license"), bBlockedLicense);
+    ResultObj->SetStringField(TEXT("licenseClass"), LicenseClass);
+    ResultObj->SetNumberField(TEXT("missing_config_key_count"), MissingConfigKeys.Num());
+    ResultObj->SetNumberField(TEXT("missing_asset_count"), MissingAssets.Num());
+    ResultObj->SetNumberField(TEXT("available_asset_count"), AvailableAssets.Num());
     return ResultObj;
 }
 

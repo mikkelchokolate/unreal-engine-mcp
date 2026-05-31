@@ -539,6 +539,36 @@ def export_retargeted_animations(config_path: str, script_path: str, args_json: 
 
 
 @mcp.tool()
+def validate_animation_export_config(config_path: str) -> Dict[str, Any]:
+    """
+    Validate a Sen animation export config against assets in the connected Unreal Editor project.
+
+    Args:
+        config_path: Absolute or relative path to the Sen animation export config JSON.
+    """
+    if not config_path:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'config_path' parameter")
+
+    resolved_config_path = os.path.abspath(config_path)
+    if not os.path.isfile(resolved_config_path):
+        return make_error_response(MCPErrorCode.NOT_FOUND, f"Animation export config does not exist: {resolved_config_path}")
+
+    unreal = get_unreal_connection()
+    if not unreal:
+        return make_error_response(MCPErrorCode.CONNECTION_ERROR, "Failed to connect to Unreal Engine")
+
+    try:
+        response = unreal.send_command(
+            "validate_animation_export_config",
+            {"config_path": resolved_config_path},
+        )
+        return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
+    except Exception as e:
+        logger.error(f"validate_animation_export_config error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
+@mcp.tool()
 def list_animation_assets(
     search_path: str = "/Game/",
     recursive: bool = True,
