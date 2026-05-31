@@ -9,6 +9,7 @@ import logging
 import socket
 import json
 import math
+import os
 import struct
 import sys
 import time
@@ -115,7 +116,8 @@ class UnrealConnection:
         "create_suspension_bridge",
         "create_aqueduct",
         "create_maze",
-        "execute_unreal_python"
+        "execute_unreal_python",
+        "export_retargeted_animations"
     }
     
     def __init__(self):
@@ -496,6 +498,43 @@ def execute_unreal_python(script_path: str, args_json: str = "{}") -> Dict[str, 
         return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
     except Exception as e:
         logger.error(f"execute_unreal_python error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
+@mcp.tool()
+def export_retargeted_animations(config_path: str, script_path: str, args_json: str = "{}") -> Dict[str, Any]:
+    """
+    Run a retarget/export Python script inside the connected Unreal Editor.
+
+    Args:
+        config_path: Absolute or relative path to the Sen animation export config JSON.
+        script_path: Absolute or relative path to the Unreal Python retarget/export script.
+        args_json: Optional extra JSON object merged into the script arguments.
+    """
+    if not config_path:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'config_path' parameter")
+    if not script_path:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'script_path' parameter")
+
+    resolved_config_path = os.path.abspath(config_path)
+    resolved_script_path = os.path.abspath(script_path)
+    if not os.path.isfile(resolved_config_path):
+        return make_error_response(MCPErrorCode.NOT_FOUND, f"Animation export config does not exist: {resolved_config_path}")
+    if not os.path.isfile(resolved_script_path):
+        return make_error_response(MCPErrorCode.NOT_FOUND, f"Animation export script does not exist: {resolved_script_path}")
+
+    try:
+        payload = json.loads(args_json) if args_json else {}
+    except json.JSONDecodeError as e:
+        return make_error_response(MCPErrorCode.INVALID_PARAM, f"args_json is not valid JSON: {e}")
+    if not isinstance(payload, dict):
+        return make_error_response(MCPErrorCode.INVALID_PARAM, "args_json must decode to a JSON object")
+
+    payload["config_path"] = resolved_config_path
+    try:
+        return execute_unreal_python(resolved_script_path, json.dumps(payload))
+    except Exception as e:
+        logger.error(f"export_retargeted_animations error: {e}")
         return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
 
 

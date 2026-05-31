@@ -42,6 +42,8 @@
 #include "Slate/SceneViewport.h"
 #include "IPythonScriptPlugin.h"
 #include "Misc/Base64.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 
 // ============================================================================
 // Anonymous namespace: reflection helper functions (merged from standalone)
@@ -593,6 +595,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     else if (CommandType == TEXT("delete_actor")) { return HandleDeleteActor(Params); }
     else if (CommandType == TEXT("set_actor_transform")) { return HandleSetActorTransform(Params); }
     else if (CommandType == TEXT("execute_unreal_python")) { return HandleExecuteUnrealPython(Params); }
+    else if (CommandType == TEXT("export_retargeted_animations")) { return HandleExportRetargetedAnimations(Params); }
     else if (CommandType == TEXT("spawn_blueprint_actor")) { return HandleSpawnBlueprintActor(Params); }
     // Editor lifecycle
     else if (CommandType == TEXT("request_editor_exit")) { return HandleRequestEditorExit(Params); }
@@ -805,6 +808,37 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleSetActorTransform(co
 
     TargetActor->SetActorTransform(NewTransform);
     return FEpicUnrealMCPCommonUtils::ActorToJsonObject(TargetActor, true);
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExportRetargetedAnimations(const TSharedPtr<FJsonObject>& Params)
+{
+    FString ConfigPath;
+    if (!Params.IsValid() || (!Params->TryGetStringField(TEXT("config_path"), ConfigPath) &&
+                              !Params->TryGetStringField(TEXT("configPath"), ConfigPath)))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'config_path' parameter"));
+    }
+
+    FString ScriptPath;
+    if (!Params->TryGetStringField(TEXT("script_path"), ScriptPath) &&
+        !Params->TryGetStringField(TEXT("scriptPath"), ScriptPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'script_path' parameter"));
+    }
+
+    TSharedPtr<FJsonObject> ArgsObject = MakeShared<FJsonObject>();
+    ArgsObject->SetStringField(TEXT("config_path"), ConfigPath);
+
+    FString ArgsJson;
+    TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&ArgsJson);
+    FJsonSerializer::Serialize(ArgsObject.ToSharedRef(), Writer);
+
+    TSharedPtr<FJsonObject> PythonParams = MakeShared<FJsonObject>();
+    PythonParams->SetStringField(TEXT("script_path"), ScriptPath);
+    PythonParams->SetStringField(TEXT("args_json"), ArgsJson);
+    return HandleExecuteUnrealPython(PythonParams);
 }
 
 TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExecuteUnrealPython(const TSharedPtr<FJsonObject>& Params)
