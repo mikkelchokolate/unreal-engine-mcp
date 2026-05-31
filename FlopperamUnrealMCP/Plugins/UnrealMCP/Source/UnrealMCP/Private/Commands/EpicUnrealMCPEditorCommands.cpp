@@ -40,6 +40,8 @@
 // Phase 1: Viewport
 #include "LevelEditor.h"
 #include "Slate/SceneViewport.h"
+#include "IPythonScriptPlugin.h"
+#include "Misc/Base64.h"
 
 // ============================================================================
 // Anonymous namespace: reflection helper functions (merged from standalone)
@@ -590,6 +592,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     else if (CommandType == TEXT("spawn_actor")) { return HandleSpawnActor(Params); }
     else if (CommandType == TEXT("delete_actor")) { return HandleDeleteActor(Params); }
     else if (CommandType == TEXT("set_actor_transform")) { return HandleSetActorTransform(Params); }
+    else if (CommandType == TEXT("execute_unreal_python")) { return HandleExecuteUnrealPython(Params); }
     else if (CommandType == TEXT("spawn_blueprint_actor")) { return HandleSpawnBlueprintActor(Params); }
     // Editor lifecycle
     else if (CommandType == TEXT("request_editor_exit")) { return HandleRequestEditorExit(Params); }
@@ -802,6 +805,70 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleSetActorTransform(co
 
     TargetActor->SetActorTransform(NewTransform);
     return FEpicUnrealMCPCommonUtils::ActorToJsonObject(TargetActor, true);
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExecuteUnrealPython(const TSharedPtr<FJsonObject>& Params)
+{
+    FString ScriptPath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("script_path"), ScriptPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'script_path' parameter"));
+    }
+
+    FString ArgsJson;
+    Params->TryGetStringField(TEXT("args_json"), ArgsJson);
+
+    IPythonScriptPlugin* PythonPlugin = IPythonScriptPlugin::Get();
+    if (!PythonPlugin)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::UNKNOWN_ERROR, TEXT("PythonScriptPlugin is not loaded"));
+    }
+
+    if (!PythonPlugin->IsPythonInitialized())
+    {
+        PythonPlugin->ForceEnablePythonAtRuntime();
+    }
+    if (!PythonPlugin->IsPythonAvailable() || !PythonPlugin->IsPythonInitialized())
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::UNKNOWN_ERROR, TEXT("PythonScriptPlugin is not ready"));
+    }
+
+    FPythonCommandEx PythonCommand;
+    PythonCommand.Flags |= EPythonCommandFlags::Unattended;
+    PythonCommand.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
+    PythonCommand.Command = FString::Printf(
+        TEXT("import base64, os, runpy\n")
+        TEXT("os.environ['UNREAL_MCP_ARGS_JSON'] = base64.b64decode('%s').decode('utf-8')\n")
+        TEXT("runpy.run_path(base64.b64decode('%s').decode('utf-8'), run_name='__main__')"),
+        *FBase64::Encode(ArgsJson),
+        *FBase64::Encode(ScriptPath)
+    );
+    const bool bSuccess = PythonPlugin->ExecPythonCommandEx(PythonCommand);
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), bSuccess);
+    ResultObj->SetStringField(TEXT("script_path"), ScriptPath);
+    ResultObj->SetStringField(TEXT("command_result"), PythonCommand.CommandResult);
+
+    TArray<TSharedPtr<FJsonValue>> LogOutput;
+    for (const FPythonLogOutputEntry& Entry : PythonCommand.LogOutput)
+    {
+        TSharedPtr<FJsonObject> LogEntry = MakeShared<FJsonObject>();
+        LogEntry->SetStringField(TEXT("type"), LexToString(Entry.Type));
+        LogEntry->SetStringField(TEXT("output"), Entry.Output);
+        LogOutput.Add(MakeShared<FJsonValueObject>(LogEntry));
+    }
+    ResultObj->SetArrayField(TEXT("log_output"), LogOutput);
+
+    if (!bSuccess)
+    {
+        ResultObj->SetStringField(TEXT("error"), PythonCommand.CommandResult);
+        ResultObj->SetStringField(TEXT("error_code"), MCPErrorCodes::UNKNOWN_ERROR);
+    }
+    return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleSpawnBlueprintActor(const TSharedPtr<FJsonObject>& Params)

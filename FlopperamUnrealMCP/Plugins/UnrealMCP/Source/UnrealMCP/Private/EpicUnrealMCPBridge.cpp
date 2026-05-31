@@ -392,6 +392,7 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const T
                      CommandType == TEXT("spawn_actor") ||
                      CommandType == TEXT("delete_actor") ||
                      CommandType == TEXT("set_actor_transform") ||
+                     CommandType == TEXT("execute_unreal_python") ||
                      CommandType == TEXT("spawn_blueprint_actor") ||
                      CommandType == TEXT("request_editor_exit") ||
                      CommandType == TEXT("restart_editor") ||
@@ -581,6 +582,7 @@ TSharedPtr<FJsonObject> UEpicUnrealMCPBridge::DispatchToHandler(
              CommandType == TEXT("spawn_actor") ||
              CommandType == TEXT("delete_actor") ||
              CommandType == TEXT("set_actor_transform") ||
+             CommandType == TEXT("execute_unreal_python") ||
              CommandType == TEXT("spawn_blueprint_actor") ||
              CommandType == TEXT("request_editor_exit") ||
              CommandType == TEXT("restart_editor") ||

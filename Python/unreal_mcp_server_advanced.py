@@ -114,7 +114,8 @@ class UnrealConnection:
         "construct_mansion",
         "create_suspension_bridge",
         "create_aqueduct",
-        "create_maze"
+        "create_maze",
+        "execute_unreal_python"
     }
     
     def __init__(self):
@@ -471,6 +472,33 @@ mcp = FastMCP(
 )
 
 # Essential Actor Management Tools
+@mcp.tool()
+def execute_unreal_python(script_path: str, args_json: str = "{}") -> Dict[str, Any]:
+    """
+    Execute a Python file inside the connected Unreal Editor.
+
+    Args:
+        script_path: Absolute path to the Python file.
+        args_json: JSON string exposed to the script as UNREAL_MCP_ARGS_JSON.
+    """
+    if not os.path.isfile(script_path):
+        return make_error_response(MCPErrorCode.NOT_FOUND, f"Python script does not exist: {script_path}")
+
+    unreal = get_unreal_connection()
+    try:
+        response = unreal.send_command(
+            "execute_unreal_python",
+            {
+                "script_path": os.path.abspath(script_path),
+                "args_json": args_json,
+            },
+        )
+        return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
+    except Exception as e:
+        logger.error(f"execute_unreal_python error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
 @mcp.tool()
 def get_actors_in_level(random_string: str = "") -> Dict[str, Any]:
     """Get a list of all actors in the current level."""

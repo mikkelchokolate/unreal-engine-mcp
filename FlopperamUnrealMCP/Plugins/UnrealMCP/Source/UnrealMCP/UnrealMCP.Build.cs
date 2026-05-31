@@ -61,7 +61,8 @@ public class UnrealMCP : ModuleRules
 				"Kismet",
 				"UMG",
 				"Projects",
-				"AssetRegistry"
+				"AssetRegistry",
+				"PythonScriptPlugin"
 			}
 		);
 		
