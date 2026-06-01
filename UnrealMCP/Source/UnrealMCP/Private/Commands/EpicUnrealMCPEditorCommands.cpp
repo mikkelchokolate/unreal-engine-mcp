@@ -22,11 +22,18 @@
 #include "Engine/Blueprint.h"
 #include "Engine/BlueprintGeneratedClass.h"
 #include "EditorAssetLibrary.h"
+#include "AssetImportTask.h"
+#include "AssetToolsModule.h"
 #include "Commands/EpicUnrealMCPBlueprintCommands.h"
 #include "Misc/Paths.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformMisc.h"
 #include "UObject/UnrealType.h"
+#include "Factories/FbxFactory.h"
+#include "Factories/FbxImportUI.h"
+#include "Factories/FbxSkeletalMeshImportData.h"
+#include "IAssetTools.h"
+#include "Modules/ModuleManager.h"
 // Phase 1: Editor lifecycle
 #include "Misc/EngineVersion.h"
 #include "FileHelpers.h"
@@ -598,6 +605,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     else if (CommandType == TEXT("execute_unreal_python")) { return HandleExecuteUnrealPython(Params); }
     else if (CommandType == TEXT("export_retargeted_animations")) { return HandleExportRetargetedAnimations(Params); }
     else if (CommandType == TEXT("validate_animation_export_config")) { return HandleValidateAnimationExportConfig(Params); }
+    else if (CommandType == TEXT("import_skeletal_mesh_asset")) { return HandleImportSkeletalMeshAsset(Params); }
     else if (CommandType == TEXT("list_animation_assets")) { return HandleListAnimationAssets(Params); }
     else if (CommandType == TEXT("spawn_blueprint_actor")) { return HandleSpawnBlueprintActor(Params); }
     // Editor lifecycle
@@ -1060,6 +1068,199 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleValidateAnimationExp
     ResultObj->SetNumberField(TEXT("missing_config_key_count"), MissingConfigKeys.Num());
     ResultObj->SetNumberField(TEXT("missing_asset_count"), MissingAssets.Num());
     ResultObj->SetNumberField(TEXT("available_asset_count"), AvailableAssets.Num());
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleImportSkeletalMeshAsset(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SourcePath;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("source_path"), SourcePath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'source_path' parameter"));
+    }
+
+    FString DestinationPath;
+    if (!Params->TryGetStringField(TEXT("destination_path"), DestinationPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'destination_path' parameter"));
+    }
+
+    FString DestinationName;
+    if (!Params->TryGetStringField(TEXT("destination_name"), DestinationName))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'destination_name' parameter"));
+    }
+
+    if (!FPaths::FileExists(SourcePath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::NOT_FOUND,
+            FString::Printf(TEXT("Skeletal mesh source file does not exist: %s"), *SourcePath));
+    }
+
+    if (!DestinationPath.StartsWith(TEXT("/Game/")) && DestinationPath != TEXT("/Game"))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::INVALID_PARAM,
+            TEXT("destination_path must be an Unreal game content path such as /Game/Senko"));
+    }
+
+    bool bReplaceExisting = true;
+    bool bSave = true;
+    bool bImportMaterials = true;
+    bool bImportTextures = true;
+    bool bCreatePhysicsAsset = false;
+    Params->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
+    Params->TryGetBoolField(TEXT("save"), bSave);
+    Params->TryGetBoolField(TEXT("import_materials"), bImportMaterials);
+    Params->TryGetBoolField(TEXT("import_textures"), bImportTextures);
+    Params->TryGetBoolField(TEXT("create_physics_asset"), bCreatePhysicsAsset);
+
+    UFbxFactory* FbxFactory = NewObject<UFbxFactory>();
+    FbxFactory->AddToRoot();
+    FbxFactory->SetDetectImportTypeOnImport(false);
+
+    if (!FbxFactory->ImportUI)
+    {
+        FbxFactory->ImportUI = NewObject<UFbxImportUI>(FbxFactory);
+    }
+
+    UFbxImportUI* ImportUI = FbxFactory->ImportUI;
+    ImportUI->MeshTypeToImport = FBXIT_SkeletalMesh;
+    ImportUI->OriginalImportType = FBXIT_SkeletalMesh;
+    ImportUI->bAutomatedImportShouldDetectType = false;
+    ImportUI->bImportAsSkeletal = true;
+    ImportUI->bImportMesh = true;
+    ImportUI->bImportAnimations = false;
+    ImportUI->bCreatePhysicsAsset = bCreatePhysicsAsset;
+    ImportUI->bImportMaterials = bImportMaterials;
+    ImportUI->bImportTextures = bImportTextures;
+
+    if (ImportUI->SkeletalMeshImportData)
+    {
+        ImportUI->SkeletalMeshImportData->bImportMeshLODs = false;
+        ImportUI->SkeletalMeshImportData->bImportMorphTargets = false;
+        ImportUI->SkeletalMeshImportData->bImportMeshesInBoneHierarchy = true;
+        ImportUI->SkeletalMeshImportData->ImportContentType = EFBXImportContentType::FBXICT_All;
+    }
+
+    UAssetImportTask* Task = NewObject<UAssetImportTask>();
+    Task->AddToRoot();
+    Task->Filename = SourcePath;
+    Task->DestinationPath = DestinationPath;
+    Task->DestinationName = DestinationName;
+    Task->bAutomated = true;
+    Task->bReplaceExisting = bReplaceExisting;
+    Task->bReplaceExistingSettings = true;
+    Task->bSave = false;
+    Task->bAsync = false;
+    Task->Factory = FbxFactory;
+    Task->Options = ImportUI;
+    FbxFactory->SetAssetImportTask(Task);
+
+    FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+    TArray<UAssetImportTask*> Tasks;
+    Tasks.Add(Task);
+    AssetToolsModule.Get().ImportAssetTasks(Tasks);
+
+    TArray<TSharedPtr<FJsonValue>> ImportedObjectPaths;
+    for (const FString& ImportedPath : Task->ImportedObjectPaths)
+    {
+        ImportedObjectPaths.Add(MakeShared<FJsonValueString>(ImportedPath));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> ImportedObjects;
+    TArray<UObject*> ImportedAssetObjects;
+    FString PrimaryAssetPath;
+    for (UObject* ImportedObject : Task->GetObjects())
+    {
+        if (!ImportedObject)
+        {
+            continue;
+        }
+
+        if (PrimaryAssetPath.IsEmpty())
+        {
+            PrimaryAssetPath = ImportedObject->GetPathName();
+        }
+
+        ImportedAssetObjects.Add(ImportedObject);
+
+        TSharedPtr<FJsonObject> ObjectObj = MakeShared<FJsonObject>();
+        ObjectObj->SetStringField(TEXT("name"), ImportedObject->GetName());
+        ObjectObj->SetStringField(TEXT("path"), ImportedObject->GetPathName());
+        ObjectObj->SetStringField(TEXT("class"), ImportedObject->GetClass() ? ImportedObject->GetClass()->GetName() : TEXT(""));
+        ImportedObjects.Add(MakeShared<FJsonValueObject>(ObjectObj));
+    }
+
+    if (ImportedObjectPaths.Num() == 0 && ImportedObjects.Num() == 0)
+    {
+        Task->RemoveFromRoot();
+        FbxFactory->RemoveFromRoot();
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::UNKNOWN_ERROR,
+            FString::Printf(TEXT("Unreal imported no assets from %s"), *SourcePath));
+    }
+
+    TArray<TSharedPtr<FJsonValue>> SavedAssetPaths;
+    if (bSave)
+    {
+        TArray<TSharedPtr<FJsonValue>> FailedSaveAssetPaths;
+        for (UObject* ImportedObject : ImportedAssetObjects)
+        {
+            if (!ImportedObject)
+            {
+                continue;
+            }
+
+            const FString ObjectPath = ImportedObject->GetPathName();
+            if (UEditorAssetLibrary::SaveLoadedAsset(ImportedObject, false))
+            {
+                SavedAssetPaths.Add(MakeShared<FJsonValueString>(ObjectPath));
+            }
+            else
+            {
+                FailedSaveAssetPaths.Add(MakeShared<FJsonValueString>(ObjectPath));
+            }
+        }
+
+        if (FailedSaveAssetPaths.Num() > 0)
+        {
+            Task->RemoveFromRoot();
+            FbxFactory->RemoveFromRoot();
+            FString FailedPathsString;
+            for (const TSharedPtr<FJsonValue>& FailedPathValue : FailedSaveAssetPaths)
+            {
+                if (!FailedPathsString.IsEmpty())
+                {
+                    FailedPathsString += TEXT(", ");
+                }
+                FailedPathsString += FailedPathValue.IsValid() ? FailedPathValue->AsString() : TEXT("<unknown>");
+            }
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::UNKNOWN_ERROR,
+                FString::Printf(TEXT("Imported skeletal mesh, but failed to save imported assets: %s"), *FailedPathsString));
+        }
+    }
+
+    Task->RemoveFromRoot();
+    FbxFactory->RemoveFromRoot();
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("source_path"), SourcePath);
+    ResultObj->SetStringField(TEXT("destination_path"), DestinationPath);
+    ResultObj->SetStringField(TEXT("destination_name"), DestinationName);
+    ResultObj->SetStringField(TEXT("asset_path"), PrimaryAssetPath);
+    ResultObj->SetArrayField(TEXT("imported_object_paths"), ImportedObjectPaths);
+    ResultObj->SetArrayField(TEXT("imported_objects"), ImportedObjects);
+    ResultObj->SetNumberField(TEXT("imported_object_count"), ImportedObjects.Num());
+    ResultObj->SetBoolField(TEXT("save_requested"), bSave);
+    ResultObj->SetArrayField(TEXT("saved_asset_paths"), SavedAssetPaths);
+    ResultObj->SetNumberField(TEXT("saved_asset_count"), SavedAssetPaths.Num());
     return ResultObj;
 }
 

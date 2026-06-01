@@ -62,6 +62,7 @@ public class UnrealMCP : ModuleRules
 				"UMG",
 				"Projects",
 				"AssetRegistry",
+				"AssetTools",
 				"PythonScriptPlugin"
 			}
 		);

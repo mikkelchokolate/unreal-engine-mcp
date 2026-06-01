@@ -117,7 +117,8 @@ class UnrealConnection:
         "create_aqueduct",
         "create_maze",
         "execute_unreal_python",
-        "export_retargeted_animations"
+        "export_retargeted_animations",
+        "import_skeletal_mesh_asset"
     }
     
     def __init__(self):
@@ -565,6 +566,65 @@ def validate_animation_export_config(config_path: str) -> Dict[str, Any]:
         return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
     except Exception as e:
         logger.error(f"validate_animation_export_config error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
+@mcp.tool()
+def import_skeletal_mesh_asset(
+    source_path: str,
+    destination_path: str,
+    destination_name: str,
+    replace_existing: bool = True,
+    save: bool = True,
+    import_materials: bool = True,
+    import_textures: bool = True,
+    create_physics_asset: bool = False,
+) -> Dict[str, Any]:
+    """
+    Import an FBX file as a SkeletalMesh asset in the connected Unreal Editor project.
+
+    Args:
+        source_path: Absolute or relative filesystem path to the FBX file.
+        destination_path: Unreal content folder, such as /Game/Senko.
+        destination_name: Imported asset base name, such as SK_Senko.
+        replace_existing: Whether to overwrite an existing asset at the destination.
+        save: Whether Unreal should save imported packages.
+        import_materials: Whether FBX materials should be imported.
+        import_textures: Whether FBX textures should be imported.
+        create_physics_asset: Whether Unreal should create a PhysicsAsset for the mesh.
+    """
+    if not source_path:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'source_path' parameter")
+    if not destination_path:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'destination_path' parameter")
+    if not destination_name:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'destination_name' parameter")
+
+    resolved_source_path = os.path.abspath(source_path)
+    if not os.path.isfile(resolved_source_path):
+        return make_error_response(MCPErrorCode.NOT_FOUND, f"Skeletal mesh source file does not exist: {resolved_source_path}")
+
+    unreal = get_unreal_connection()
+    if not unreal:
+        return make_error_response(MCPErrorCode.CONNECTION_ERROR, "Failed to connect to Unreal Engine")
+
+    try:
+        response = unreal.send_command(
+            "import_skeletal_mesh_asset",
+            {
+                "source_path": resolved_source_path,
+                "destination_path": destination_path,
+                "destination_name": destination_name,
+                "replace_existing": replace_existing,
+                "save": save,
+                "import_materials": import_materials,
+                "import_textures": import_textures,
+                "create_physics_asset": create_physics_asset,
+            },
+        )
+        return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
+    except Exception as e:
+        logger.error(f"import_skeletal_mesh_asset error: {e}")
         return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
 
 
