@@ -25,10 +25,20 @@
 #include "AssetImportTask.h"
 #include "AssetToolsModule.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "Engine/SkeletalMesh.h"
 #include "Commands/EpicUnrealMCPBlueprintCommands.h"
 #include "HAL/FileManager.h"
 #include "Misc/Paths.h"
 #include "Misc/PackageName.h"
+#include "ReferenceSkeleton.h"
+#include "RetargetEditor/IKRetargetFactory.h"
+#include "RetargetEditor/IKRetargeterController.h"
+#include "Retargeter/IKRetargetChainMapping.h"
+#include "Retargeter/IKRetargeter.h"
+#include "Retargeter/IKRetargetSettings.h"
+#include "Rig/IKRigDefinition.h"
+#include "RigEditor/IKRigController.h"
+#include "RigEditor/IKRigDefinitionFactory.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformMisc.h"
 #include "UObject/UnrealType.h"
@@ -610,6 +620,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     else if (CommandType == TEXT("validate_animation_export_config")) { return HandleValidateAnimationExportConfig(Params); }
     else if (CommandType == TEXT("import_skeletal_mesh_asset")) { return HandleImportSkeletalMeshAsset(Params); }
     else if (CommandType == TEXT("copy_content_tree_from_disk")) { return HandleCopyContentTreeFromDisk(Params); }
+    else if (CommandType == TEXT("create_ik_retargeter_assets")) { return HandleCreateIKRetargeterAssets(Params); }
     else if (CommandType == TEXT("list_animation_assets")) { return HandleListAnimationAssets(Params); }
     else if (CommandType == TEXT("spawn_blueprint_actor")) { return HandleSpawnBlueprintActor(Params); }
     // Editor lifecycle
@@ -1437,6 +1448,317 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCopyContentTreeFromD
     ResultObj->SetNumberField(TEXT("copied_asset_count"), CopiedAssetPaths.Num());
     ResultObj->SetNumberField(TEXT("loaded_asset_count"), LoadedAssetPaths.Num());
     ResultObj->SetNumberField(TEXT("failed_asset_count"), FailedAssetPaths.Num());
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCreateIKRetargeterAssets(const TSharedPtr<FJsonObject>& Params)
+{
+    auto RequireString = [&Params](const TCHAR* FieldName, FString& OutValue) -> bool
+    {
+        return Params.IsValid() && Params->TryGetStringField(FieldName, OutValue) && !OutValue.IsEmpty();
+    };
+
+    FString SourceIKRigPath;
+    FString SourceMeshPath;
+    FString TargetMeshPath;
+    FString TargetIKRigPath;
+    FString RetargeterPath;
+    FString TargetRetargetRoot;
+    if (!RequireString(TEXT("source_ik_rig_path"), SourceIKRigPath) ||
+        !RequireString(TEXT("source_mesh_path"), SourceMeshPath) ||
+        !RequireString(TEXT("target_mesh_path"), TargetMeshPath) ||
+        !RequireString(TEXT("target_ik_rig_path"), TargetIKRigPath) ||
+        !RequireString(TEXT("retargeter_path"), RetargeterPath) ||
+        !RequireString(TEXT("target_retarget_root"), TargetRetargetRoot))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM,
+            TEXT("Missing one of required parameters: source_ik_rig_path, source_mesh_path, target_mesh_path, target_ik_rig_path, retargeter_path, target_retarget_root"));
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* TargetChainValues = nullptr;
+    if (!Params->TryGetArrayField(TEXT("target_chains"), TargetChainValues) || !TargetChainValues || TargetChainValues->Num() == 0)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing non-empty 'target_chains' array"));
+    }
+
+    bool bReplaceExisting = false;
+    bool bAutoMapChains = true;
+    bool bAddDefaultOps = true;
+    Params->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
+    Params->TryGetBoolField(TEXT("auto_map_chains"), bAutoMapChains);
+    Params->TryGetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+
+    auto LoadAssetExpanded = [](FString AssetPath) -> UObject*
+    {
+        AssetPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+        UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
+        if (!Asset && AssetPath.StartsWith(TEXT("/")) && !AssetPath.Contains(TEXT(".")))
+        {
+            const FString AssetName = FPaths::GetBaseFilename(AssetPath);
+            const FString ExpandedPath = FString::Printf(TEXT("%s.%s"), *AssetPath, *AssetName);
+            Asset = UEditorAssetLibrary::LoadAsset(ExpandedPath);
+        }
+        return Asset;
+    };
+
+    auto SplitGameAssetPath = [](FString RawPath, FString& OutPackagePath, FString& OutAssetName, FString& OutAssetPath, FString& OutObjectPath, FString& OutError) -> bool
+    {
+        RawPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+        FString AssetPath = RawPath;
+        if (RawPath.Contains(TEXT(".")))
+        {
+            RawPath.Split(TEXT("."), &AssetPath, nullptr, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+        }
+        while (AssetPath.EndsWith(TEXT("/")) && AssetPath.Len() > 5)
+        {
+            AssetPath.LeftChopInline(1);
+        }
+        if (!AssetPath.StartsWith(TEXT("/Game/")))
+        {
+            OutError = FString::Printf(TEXT("Asset path must be under /Game: %s"), *RawPath);
+            return false;
+        }
+        OutAssetName = FPaths::GetBaseFilename(AssetPath);
+        OutPackagePath = FPaths::GetPath(AssetPath);
+        if (OutAssetName.IsEmpty() || OutPackagePath.IsEmpty())
+        {
+            OutError = FString::Printf(TEXT("Asset path must include a package and asset name: %s"), *RawPath);
+            return false;
+        }
+        OutAssetPath = AssetPath;
+        OutObjectPath = FString::Printf(TEXT("%s.%s"), *AssetPath, *OutAssetName);
+        return true;
+    };
+
+    UIKRigDefinition* SourceIKRig = Cast<UIKRigDefinition>(LoadAssetExpanded(SourceIKRigPath));
+    USkeletalMesh* SourceMesh = Cast<USkeletalMesh>(LoadAssetExpanded(SourceMeshPath));
+    USkeletalMesh* TargetMesh = Cast<USkeletalMesh>(LoadAssetExpanded(TargetMeshPath));
+    if (!SourceIKRig || !SourceMesh || !TargetMesh)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::NOT_FOUND,
+            FString::Printf(TEXT("Failed to load source IK rig, source mesh, or target mesh: %s | %s | %s"), *SourceIKRigPath, *SourceMeshPath, *TargetMeshPath));
+    }
+
+    FString TargetIKRigPackagePath;
+    FString TargetIKRigAssetName;
+    FString TargetIKRigAssetPath;
+    FString TargetIKRigObjectPath;
+    FString RetargeterPackagePath;
+    FString RetargeterAssetName;
+    FString RetargeterAssetPath;
+    FString RetargeterObjectPath;
+    FString PathError;
+    if (!SplitGameAssetPath(TargetIKRigPath, TargetIKRigPackagePath, TargetIKRigAssetName, TargetIKRigAssetPath, TargetIKRigObjectPath, PathError) ||
+        !SplitGameAssetPath(RetargeterPath, RetargeterPackagePath, RetargeterAssetName, RetargeterAssetPath, RetargeterObjectPath, PathError))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(MCPErrorCodes::INVALID_PARAM, PathError);
+    }
+
+    auto EnsureCanCreateAsset = [bReplaceExisting](const FString& AssetPath, FString& OutError) -> bool
+    {
+        if (!UEditorAssetLibrary::DoesAssetExist(AssetPath))
+        {
+            return true;
+        }
+        if (!bReplaceExisting)
+        {
+            OutError = FString::Printf(TEXT("Asset already exists and replace_existing is false: %s"), *AssetPath);
+            return false;
+        }
+        if (!UEditorAssetLibrary::DeleteAsset(AssetPath))
+        {
+            OutError = FString::Printf(TEXT("Failed to delete existing asset before recreate: %s"), *AssetPath);
+            return false;
+        }
+        return true;
+    };
+
+    FString ExistingError;
+    if (!EnsureCanCreateAsset(TargetIKRigAssetPath, ExistingError) ||
+        !EnsureCanCreateAsset(RetargeterAssetPath, ExistingError))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(MCPErrorCodes::INVALID_PARAM, ExistingError);
+    }
+
+    UEditorAssetLibrary::MakeDirectory(TargetIKRigPackagePath);
+    UEditorAssetLibrary::MakeDirectory(RetargeterPackagePath);
+
+    UIKRigDefinition* TargetIKRig = UIKRigDefinitionFactory::CreateNewIKRigAsset(TargetIKRigPackagePath, TargetIKRigAssetName);
+    if (!TargetIKRig)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::UNKNOWN_ERROR,
+            FString::Printf(TEXT("Failed to create target IK Rig asset: %s"), *TargetIKRigAssetPath));
+    }
+
+    const FReferenceSkeleton& TargetRefSkeleton = TargetMesh->GetRefSkeleton();
+    auto HasTargetBone = [&TargetRefSkeleton](const FString& BoneName) -> bool
+    {
+        return TargetRefSkeleton.FindBoneIndex(FName(*BoneName)) != INDEX_NONE;
+    };
+
+    if (!HasTargetBone(TargetRetargetRoot))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::INVALID_PARAM,
+            FString::Printf(TEXT("target_retarget_root bone not found on target mesh: %s"), *TargetRetargetRoot));
+    }
+
+    struct FRequestedRetargetChain
+    {
+        FName Name;
+        FName StartBone;
+        FName EndBone;
+        FName Goal;
+    };
+
+    TArray<FRequestedRetargetChain> RequestedChains;
+    for (const TSharedPtr<FJsonValue>& ChainValue : *TargetChainValues)
+    {
+        const TSharedPtr<FJsonObject>* ChainObjPtr = nullptr;
+        if (!ChainValue.IsValid() || !ChainValue->TryGetObject(ChainObjPtr) || !ChainObjPtr || !(*ChainObjPtr).IsValid())
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(MCPErrorCodes::INVALID_PARAM, TEXT("Each target_chains entry must be an object"));
+        }
+
+        const TSharedPtr<FJsonObject>& ChainObj = *ChainObjPtr;
+        FString ChainName;
+        FString StartBone;
+        FString EndBone;
+        FString GoalName;
+        if (!ChainObj->TryGetStringField(TEXT("name"), ChainName) ||
+            !ChainObj->TryGetStringField(TEXT("start_bone"), StartBone) ||
+            !ChainObj->TryGetStringField(TEXT("end_bone"), EndBone) ||
+            ChainName.IsEmpty() || StartBone.IsEmpty() || EndBone.IsEmpty())
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::INVALID_PARAM,
+                TEXT("Each target_chains entry requires name, start_bone, and end_bone"));
+        }
+
+        if (!HasTargetBone(StartBone) || !HasTargetBone(EndBone))
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::INVALID_PARAM,
+                FString::Printf(TEXT("Chain '%s' references missing target bones: %s -> %s"), *ChainName, *StartBone, *EndBone));
+        }
+
+        ChainObj->TryGetStringField(TEXT("goal"), GoalName);
+        RequestedChains.Add({
+            FName(*ChainName),
+            FName(*StartBone),
+            FName(*EndBone),
+            GoalName.IsEmpty() ? NAME_None : FName(*GoalName)
+        });
+    }
+
+    UIKRigController* TargetRigController = UIKRigController::GetController(TargetIKRig);
+    if (!TargetRigController || !TargetRigController->SetSkeletalMesh(TargetMesh))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(MCPErrorCodes::UNKNOWN_ERROR, TEXT("Failed to initialize target IK Rig controller with target mesh"));
+    }
+    if (!TargetRigController->SetRetargetRoot(FName(*TargetRetargetRoot)))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::INVALID_PARAM,
+            FString::Printf(TEXT("Failed to set target retarget root: %s"), *TargetRetargetRoot));
+    }
+
+    for (const FRequestedRetargetChain& Chain : RequestedChains)
+    {
+        const FName AddedName = TargetRigController->AddRetargetChain(Chain.Name, Chain.StartBone, Chain.EndBone, Chain.Goal);
+        if (AddedName == NAME_None)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::INVALID_PARAM,
+                FString::Printf(TEXT("Failed to add target retarget chain: %s"), *Chain.Name.ToString()));
+        }
+    }
+    TargetRigController->SortRetargetChains();
+
+    FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+    UIKRetargetFactory* RetargetFactory = NewObject<UIKRetargetFactory>();
+    UObject* RetargeterObject = AssetToolsModule.Get().CreateAsset(
+        RetargeterAssetName,
+        RetargeterPackagePath,
+        UIKRetargeter::StaticClass(),
+        RetargetFactory);
+    UIKRetargeter* Retargeter = Cast<UIKRetargeter>(RetargeterObject);
+    if (!Retargeter)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::UNKNOWN_ERROR,
+            FString::Printf(TEXT("Failed to create IK Retargeter asset: %s"), *RetargeterAssetPath));
+    }
+
+    UIKRetargeterController* RetargeterController = UIKRetargeterController::GetController(Retargeter);
+    if (!RetargeterController)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(MCPErrorCodes::UNKNOWN_ERROR, TEXT("Failed to get IK Retargeter controller"));
+    }
+
+    RetargeterController->SetIKRig(ERetargetSourceOrTarget::Source, SourceIKRig);
+    RetargeterController->SetIKRig(ERetargetSourceOrTarget::Target, TargetIKRig);
+    RetargeterController->SetPreviewMesh(ERetargetSourceOrTarget::Source, SourceMesh);
+    RetargeterController->SetPreviewMesh(ERetargetSourceOrTarget::Target, TargetMesh);
+    if (bAddDefaultOps)
+    {
+        RetargeterController->AddDefaultOps();
+        RetargeterController->AssignIKRigToAllOps(ERetargetSourceOrTarget::Source, SourceIKRig);
+        RetargeterController->AssignIKRigToAllOps(ERetargetSourceOrTarget::Target, TargetIKRig);
+    }
+    if (bAutoMapChains)
+    {
+        RetargeterController->AutoMapChains(EAutoMapChainType::Exact, true);
+    }
+    RetargeterController->CleanAsset();
+
+    TargetIKRig->MarkPackageDirty();
+    TargetIKRig->PostEditChange();
+    Retargeter->MarkPackageDirty();
+    Retargeter->PostEditChange();
+
+    const bool bSavedTargetRig = UEditorAssetLibrary::SaveLoadedAsset(TargetIKRig, false);
+    const bool bSavedRetargeter = UEditorAssetLibrary::SaveLoadedAsset(Retargeter, false);
+
+    auto ChainNamesToJson = [](const TArray<FBoneChain>& Chains) -> TArray<TSharedPtr<FJsonValue>>
+    {
+        TArray<TSharedPtr<FJsonValue>> Names;
+        for (const FBoneChain& Chain : Chains)
+        {
+            Names.Add(MakeShared<FJsonValueString>(Chain.ChainName.ToString()));
+        }
+        return Names;
+    };
+
+    TArray<TSharedPtr<FJsonValue>> ChainMappings;
+    for (const FBoneChain& TargetChain : TargetIKRig->GetRetargetChains())
+    {
+        TSharedPtr<FJsonObject> MappingObj = MakeShared<FJsonObject>();
+        MappingObj->SetStringField(TEXT("target_chain"), TargetChain.ChainName.ToString());
+        MappingObj->SetStringField(TEXT("source_chain"), RetargeterController->GetSourceChain(TargetChain.ChainName).ToString());
+        ChainMappings.Add(MakeShared<FJsonValueObject>(MappingObj));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("source_ik_rig_path"), SourceIKRig->GetPathName());
+    ResultObj->SetStringField(TEXT("source_mesh_path"), SourceMesh->GetPathName());
+    ResultObj->SetStringField(TEXT("target_mesh_path"), TargetMesh->GetPathName());
+    ResultObj->SetStringField(TEXT("target_ik_rig_path"), TargetIKRig->GetPathName());
+    ResultObj->SetStringField(TEXT("retargeter_path"), Retargeter->GetPathName());
+    ResultObj->SetStringField(TEXT("target_retarget_root"), TargetRetargetRoot);
+    ResultObj->SetBoolField(TEXT("replace_existing"), bReplaceExisting);
+    ResultObj->SetBoolField(TEXT("auto_map_chains"), bAutoMapChains);
+    ResultObj->SetBoolField(TEXT("add_default_ops"), bAddDefaultOps);
+    ResultObj->SetBoolField(TEXT("saved_target_ik_rig"), bSavedTargetRig);
+    ResultObj->SetBoolField(TEXT("saved_retargeter"), bSavedRetargeter);
+    ResultObj->SetArrayField(TEXT("source_chain_names"), ChainNamesToJson(SourceIKRig->GetRetargetChains()));
+    ResultObj->SetArrayField(TEXT("target_chain_names"), ChainNamesToJson(TargetIKRig->GetRetargetChains()));
+    ResultObj->SetArrayField(TEXT("chain_mappings"), ChainMappings);
     return ResultObj;
 }
 

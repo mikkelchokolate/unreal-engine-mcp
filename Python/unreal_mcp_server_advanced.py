@@ -119,7 +119,8 @@ class UnrealConnection:
         "execute_unreal_python",
         "export_retargeted_animations",
         "import_skeletal_mesh_asset",
-        "copy_content_tree_from_disk"
+        "copy_content_tree_from_disk",
+        "create_ik_retargeter_assets"
     }
     
     def __init__(self):
@@ -672,6 +673,74 @@ def copy_content_tree_from_disk(
         return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
     except Exception as e:
         logger.error(f"copy_content_tree_from_disk error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
+@mcp.tool()
+def create_ik_retargeter_assets(
+    source_ik_rig_path: str,
+    source_mesh_path: str,
+    target_mesh_path: str,
+    target_ik_rig_path: str,
+    retargeter_path: str,
+    target_retarget_root: str,
+    target_chains: List[Dict[str, str]],
+    replace_existing: bool = False,
+    auto_map_chains: bool = True,
+    add_default_ops: bool = True,
+) -> Dict[str, Any]:
+    """
+    Create a target IK Rig and IK Retargeter asset in the connected Unreal project.
+
+    Args:
+        source_ik_rig_path: Existing source IK Rig asset path.
+        source_mesh_path: Existing source Skeletal Mesh asset path.
+        target_mesh_path: Existing target Skeletal Mesh asset path.
+        target_ik_rig_path: Destination IK Rig asset path for the target mesh.
+        retargeter_path: Destination IK Retargeter asset path.
+        target_retarget_root: Target skeleton pelvis/root bone used by retargeting.
+        target_chains: Chain dicts with name, start_bone, end_bone, and optional goal.
+        replace_existing: Whether to delete and recreate existing destination assets.
+        auto_map_chains: Whether to auto-map source/target chains by exact name.
+        add_default_ops: Whether to add Unreal's default retarget operation stack.
+    """
+    required = {
+        "source_ik_rig_path": source_ik_rig_path,
+        "source_mesh_path": source_mesh_path,
+        "target_mesh_path": target_mesh_path,
+        "target_ik_rig_path": target_ik_rig_path,
+        "retargeter_path": retargeter_path,
+        "target_retarget_root": target_retarget_root,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, f"Missing required parameter(s): {', '.join(missing)}")
+    if not target_chains:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'target_chains' entries")
+
+    unreal = get_unreal_connection()
+    if not unreal:
+        return make_error_response(MCPErrorCode.CONNECTION_ERROR, "Failed to connect to Unreal Engine")
+
+    try:
+        response = unreal.send_command(
+            "create_ik_retargeter_assets",
+            {
+                "source_ik_rig_path": source_ik_rig_path,
+                "source_mesh_path": source_mesh_path,
+                "target_mesh_path": target_mesh_path,
+                "target_ik_rig_path": target_ik_rig_path,
+                "retargeter_path": retargeter_path,
+                "target_retarget_root": target_retarget_root,
+                "target_chains": target_chains,
+                "replace_existing": replace_existing,
+                "auto_map_chains": auto_map_chains,
+                "add_default_ops": add_default_ops,
+            },
+        )
+        return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
+    except Exception as e:
+        logger.error(f"create_ik_retargeter_assets error: {e}")
         return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
 
 

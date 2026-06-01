@@ -63,6 +63,8 @@ public class UnrealMCP : ModuleRules
 				"Projects",
 				"AssetRegistry",
 				"AssetTools",
+				"IKRig",
+				"IKRigEditor",
 				"PythonScriptPlugin"
 			}
 		);
