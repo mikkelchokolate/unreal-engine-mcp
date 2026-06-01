@@ -29,6 +29,7 @@ private:
     TSharedPtr<FJsonObject> HandleImportSkeletalMeshAsset(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCopyContentTreeFromDisk(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCreateIKRetargeterAssets(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleEnsureAnimationSkeletons(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleListAnimationAssets(const TSharedPtr<FJsonObject>& Params);
 
     // Blueprint actor spawning

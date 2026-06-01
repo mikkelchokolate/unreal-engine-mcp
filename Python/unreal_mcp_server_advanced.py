@@ -120,7 +120,8 @@ class UnrealConnection:
         "export_retargeted_animations",
         "import_skeletal_mesh_asset",
         "copy_content_tree_from_disk",
-        "create_ik_retargeter_assets"
+        "create_ik_retargeter_assets",
+        "ensure_animation_skeletons"
     }
     
     def __init__(self):
@@ -741,6 +742,47 @@ def create_ik_retargeter_assets(
         return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
     except Exception as e:
         logger.error(f"create_ik_retargeter_assets error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
+@mcp.tool()
+def ensure_animation_skeletons(
+    mesh_skeleton_bindings: List[Dict[str, Any]],
+    replace_existing: bool = False,
+) -> Dict[str, Any]:
+    """
+    Ensure skeletal meshes and animation assets have explicit USkeleton assets before retarget/export.
+
+    Args:
+        mesh_skeleton_bindings: Binding dicts with "skeletal_mesh_path", "skeleton_path", and optional "animation_paths".
+        replace_existing: Whether to delete and recreate existing skeleton assets.
+    """
+    if not mesh_skeleton_bindings:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'mesh_skeleton_bindings' entries")
+    for index, binding in enumerate(mesh_skeleton_bindings):
+        if not binding.get("skeletal_mesh_path") or not binding.get("skeleton_path"):
+            return make_error_response(
+                MCPErrorCode.MISSING_PARAM,
+                f"Binding {index} requires 'skeletal_mesh_path' and 'skeleton_path'",
+            )
+        if "animation_paths" in binding and not isinstance(binding["animation_paths"], list):
+            return make_error_response(MCPErrorCode.INVALID_PARAM, f"Binding {index} 'animation_paths' must be a list")
+
+    unreal = get_unreal_connection()
+    if not unreal:
+        return make_error_response(MCPErrorCode.CONNECTION_ERROR, "Failed to connect to Unreal Engine")
+
+    try:
+        response = unreal.send_command(
+            "ensure_animation_skeletons",
+            {
+                "mesh_skeleton_bindings": mesh_skeleton_bindings,
+                "replace_existing": replace_existing,
+            },
+        )
+        return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
+    except Exception as e:
+        logger.error(f"ensure_animation_skeletons error: {e}")
         return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
 
 

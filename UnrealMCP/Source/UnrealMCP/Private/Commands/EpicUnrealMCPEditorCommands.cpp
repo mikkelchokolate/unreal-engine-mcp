@@ -25,6 +25,8 @@
 #include "AssetImportTask.h"
 #include "AssetToolsModule.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "Animation/AnimationAsset.h"
+#include "Animation/Skeleton.h"
 #include "Engine/SkeletalMesh.h"
 #include "Commands/EpicUnrealMCPBlueprintCommands.h"
 #include "HAL/FileManager.h"
@@ -45,6 +47,7 @@
 #include "Factories/FbxFactory.h"
 #include "Factories/FbxImportUI.h"
 #include "Factories/FbxSkeletalMeshImportData.h"
+#include "Factories/SkeletonFactory.h"
 #include "IAssetTools.h"
 #include "Modules/ModuleManager.h"
 // Phase 1: Editor lifecycle
@@ -621,6 +624,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     else if (CommandType == TEXT("import_skeletal_mesh_asset")) { return HandleImportSkeletalMeshAsset(Params); }
     else if (CommandType == TEXT("copy_content_tree_from_disk")) { return HandleCopyContentTreeFromDisk(Params); }
     else if (CommandType == TEXT("create_ik_retargeter_assets")) { return HandleCreateIKRetargeterAssets(Params); }
+    else if (CommandType == TEXT("ensure_animation_skeletons")) { return HandleEnsureAnimationSkeletons(Params); }
     else if (CommandType == TEXT("list_animation_assets")) { return HandleListAnimationAssets(Params); }
     else if (CommandType == TEXT("spawn_blueprint_actor")) { return HandleSpawnBlueprintActor(Params); }
     // Editor lifecycle
@@ -1448,6 +1452,206 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCopyContentTreeFromD
     ResultObj->SetNumberField(TEXT("copied_asset_count"), CopiedAssetPaths.Num());
     ResultObj->SetNumberField(TEXT("loaded_asset_count"), LoadedAssetPaths.Num());
     ResultObj->SetNumberField(TEXT("failed_asset_count"), FailedAssetPaths.Num());
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleEnsureAnimationSkeletons(const TSharedPtr<FJsonObject>& Params)
+{
+    const TArray<TSharedPtr<FJsonValue>>* BindingValues = nullptr;
+    if (!Params.IsValid() ||
+        !Params->TryGetArrayField(TEXT("mesh_skeleton_bindings"), BindingValues) ||
+        !BindingValues ||
+        BindingValues->Num() == 0)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM,
+            TEXT("Missing 'mesh_skeleton_bindings' entries"));
+    }
+
+    bool bReplaceExisting = false;
+    Params->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
+
+    auto LoadExpanded = [](const FString& AssetPath) -> UObject*
+    {
+        UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
+        if (!Asset && AssetPath.StartsWith(TEXT("/")) && !AssetPath.Contains(TEXT(".")))
+        {
+            const FString AssetName = FPaths::GetBaseFilename(AssetPath);
+            Asset = UEditorAssetLibrary::LoadAsset(FString::Printf(TEXT("%s.%s"), *AssetPath, *AssetName));
+        }
+        return Asset;
+    };
+
+    auto SplitObjectPath = [](const FString& ObjectPath, FString& OutPackagePath, FString& OutAssetName) -> bool
+    {
+        FString PackageName = ObjectPath;
+        if (ObjectPath.Contains(TEXT(".")))
+        {
+            FString Ignored;
+            ObjectPath.Split(TEXT("."), &PackageName, &Ignored, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+        }
+        if (!PackageName.StartsWith(TEXT("/Game/")))
+        {
+            return false;
+        }
+        OutPackagePath = FPackageName::GetLongPackagePath(PackageName);
+        OutAssetName = FPaths::GetBaseFilename(PackageName);
+        return !OutPackagePath.IsEmpty() && !OutAssetName.IsEmpty();
+    };
+
+    auto CreateOrLoadSkeleton = [&](USkeletalMesh* SkeletalMesh, const FString& SkeletonPath, bool& bOutCreated) -> USkeleton*
+    {
+        bOutCreated = false;
+        if (bReplaceExisting && UEditorAssetLibrary::DoesAssetExist(SkeletonPath))
+        {
+            UEditorAssetLibrary::DeleteAsset(SkeletonPath);
+        }
+
+        if (UObject* Existing = LoadExpanded(SkeletonPath))
+        {
+            return Cast<USkeleton>(Existing);
+        }
+
+        FString PackagePath;
+        FString AssetName;
+        if (!SplitObjectPath(SkeletonPath, PackagePath, AssetName))
+        {
+            return nullptr;
+        }
+
+        UEditorAssetLibrary::MakeDirectory(PackagePath);
+        IAssetTools& AssetTools = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools")).Get();
+        USkeletonFactory* SkeletonFactory = NewObject<USkeletonFactory>();
+        SkeletonFactory->TargetSkeletalMesh = SkeletalMesh;
+        UObject* CreatedAsset = AssetTools.CreateAsset(AssetName, PackagePath, USkeleton::StaticClass(), SkeletonFactory);
+        USkeleton* Skeleton = Cast<USkeleton>(CreatedAsset);
+        if (Skeleton && !Skeleton->MergeAllBonesToBoneTree(SkeletalMesh))
+        {
+            return nullptr;
+        }
+        bOutCreated = Skeleton != nullptr;
+        return Skeleton;
+    };
+
+    TArray<TSharedPtr<FJsonValue>> BindingResults;
+    int32 CreatedSkeletonCount = 0;
+    int32 MeshUpdatedCount = 0;
+    int32 AnimationUpdatedCount = 0;
+
+    for (const TSharedPtr<FJsonValue>& BindingValue : *BindingValues)
+    {
+        const TSharedPtr<FJsonObject>* BindingObjectPtr = nullptr;
+        if (!BindingValue.IsValid() || !BindingValue->TryGetObject(BindingObjectPtr) || !BindingObjectPtr || !BindingObjectPtr->IsValid())
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::INVALID_PARAM,
+                TEXT("Each mesh_skeleton_bindings entry must be an object"));
+        }
+
+        const TSharedPtr<FJsonObject>& BindingObject = *BindingObjectPtr;
+        FString SkeletalMeshPath;
+        FString SkeletonPath;
+        if (!BindingObject->TryGetStringField(TEXT("skeletal_mesh_path"), SkeletalMeshPath) || SkeletalMeshPath.IsEmpty() ||
+            !BindingObject->TryGetStringField(TEXT("skeleton_path"), SkeletonPath) || SkeletonPath.IsEmpty())
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::MISSING_PARAM,
+                TEXT("Each binding requires skeletal_mesh_path and skeleton_path"));
+        }
+
+        USkeletalMesh* SkeletalMesh = Cast<USkeletalMesh>(LoadExpanded(SkeletalMeshPath));
+        if (!SkeletalMesh)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::NOT_FOUND,
+                FString::Printf(TEXT("Could not load SkeletalMesh: %s"), *SkeletalMeshPath));
+        }
+
+        bool bCreatedSkeleton = false;
+        USkeleton* Skeleton = CreateOrLoadSkeleton(SkeletalMesh, SkeletonPath, bCreatedSkeleton);
+        if (!Skeleton)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::UNKNOWN_ERROR,
+                FString::Printf(TEXT("Could not create or load Skeleton: %s"), *SkeletonPath));
+        }
+        if (bCreatedSkeleton)
+        {
+            CreatedSkeletonCount++;
+        }
+
+        bool bMeshUpdated = false;
+        if (SkeletalMesh->GetSkeleton() != Skeleton)
+        {
+            SkeletalMesh->Modify();
+            SkeletalMesh->SetSkeleton(Skeleton);
+            SkeletalMesh->MarkPackageDirty();
+            bMeshUpdated = true;
+            MeshUpdatedCount++;
+        }
+        UEditorAssetLibrary::SaveLoadedAsset(SkeletalMesh);
+        UEditorAssetLibrary::SaveLoadedAsset(Skeleton);
+
+        TArray<TSharedPtr<FJsonValue>> AnimationResults;
+        const TArray<TSharedPtr<FJsonValue>>* AnimationValues = nullptr;
+        if (BindingObject->TryGetArrayField(TEXT("animation_paths"), AnimationValues) && AnimationValues)
+        {
+            for (const TSharedPtr<FJsonValue>& AnimationValue : *AnimationValues)
+            {
+                FString AnimationPath;
+                if (!AnimationValue.IsValid() || !AnimationValue->TryGetString(AnimationPath) || AnimationPath.IsEmpty())
+                {
+                    return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                        MCPErrorCodes::INVALID_PARAM,
+                        TEXT("animation_paths entries must be non-empty strings"));
+                }
+
+                UAnimationAsset* AnimationAsset = Cast<UAnimationAsset>(LoadExpanded(AnimationPath));
+                if (!AnimationAsset)
+                {
+                    return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                        MCPErrorCodes::NOT_FOUND,
+                        FString::Printf(TEXT("Could not load AnimationAsset: %s"), *AnimationPath));
+                }
+
+                const bool bAnimationUpdated = AnimationAsset->GetSkeleton() != Skeleton;
+                if (bAnimationUpdated)
+                {
+                    AnimationAsset->Modify();
+                    AnimationAsset->SetSkeleton(Skeleton);
+                    AnimationAsset->MarkPackageDirty();
+                    AnimationUpdatedCount++;
+                }
+                UEditorAssetLibrary::SaveLoadedAsset(AnimationAsset);
+
+                TSharedPtr<FJsonObject> AnimationObj = MakeShared<FJsonObject>();
+                AnimationObj->SetStringField(TEXT("animation_path"), AnimationPath);
+                AnimationObj->SetStringField(TEXT("resolved_path"), AnimationAsset->GetPathName());
+                AnimationObj->SetBoolField(TEXT("updated"), bAnimationUpdated);
+                AnimationObj->SetStringField(TEXT("skeleton_path"), Skeleton->GetPathName());
+                AnimationResults.Add(MakeShared<FJsonValueObject>(AnimationObj));
+            }
+        }
+
+        TSharedPtr<FJsonObject> BindingResult = MakeShared<FJsonObject>();
+        BindingResult->SetStringField(TEXT("skeletal_mesh_path"), SkeletalMeshPath);
+        BindingResult->SetStringField(TEXT("resolved_skeletal_mesh_path"), SkeletalMesh->GetPathName());
+        BindingResult->SetStringField(TEXT("skeleton_path"), SkeletonPath);
+        BindingResult->SetStringField(TEXT("resolved_skeleton_path"), Skeleton->GetPathName());
+        BindingResult->SetBoolField(TEXT("created_skeleton"), bCreatedSkeleton);
+        BindingResult->SetBoolField(TEXT("mesh_updated"), bMeshUpdated);
+        BindingResult->SetArrayField(TEXT("animations"), AnimationResults);
+        BindingResults.Add(MakeShared<FJsonValueObject>(BindingResult));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetBoolField(TEXT("replace_existing"), bReplaceExisting);
+    ResultObj->SetArrayField(TEXT("bindings"), BindingResults);
+    ResultObj->SetNumberField(TEXT("binding_count"), BindingResults.Num());
+    ResultObj->SetNumberField(TEXT("created_skeleton_count"), CreatedSkeletonCount);
+    ResultObj->SetNumberField(TEXT("mesh_updated_count"), MeshUpdatedCount);
+    ResultObj->SetNumberField(TEXT("animation_updated_count"), AnimationUpdatedCount);
     return ResultObj;
 }
 
