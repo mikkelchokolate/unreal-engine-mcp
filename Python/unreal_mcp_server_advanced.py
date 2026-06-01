@@ -118,7 +118,8 @@ class UnrealConnection:
         "create_maze",
         "execute_unreal_python",
         "export_retargeted_animations",
-        "import_skeletal_mesh_asset"
+        "import_skeletal_mesh_asset",
+        "copy_content_tree_from_disk"
     }
     
     def __init__(self):
@@ -625,6 +626,52 @@ def import_skeletal_mesh_asset(
         return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
     except Exception as e:
         logger.error(f"import_skeletal_mesh_asset error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
+@mcp.tool()
+def copy_content_tree_from_disk(
+    source_content_dir: str,
+    destination_path: str,
+    replace_existing: bool = False,
+) -> Dict[str, Any]:
+    """
+    Copy an Unreal content directory from disk into the connected project under /Game.
+
+    This is intended for bootstrapping installed Unreal template/sample assets into
+    a scratch project before retarget/export preflight. It copies Unreal package
+    payload files and asks the editor asset registry to rescan the destination.
+
+    Args:
+        source_content_dir: Filesystem directory containing .uasset/.uexp/.ubulk files.
+        destination_path: Unreal game content folder, such as /Game/Characters/Mannequins.
+        replace_existing: Whether to overwrite files that already exist.
+    """
+    if not source_content_dir:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'source_content_dir' parameter")
+    if not destination_path:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'destination_path' parameter")
+
+    resolved_source_dir = os.path.abspath(source_content_dir)
+    if not os.path.isdir(resolved_source_dir):
+        return make_error_response(MCPErrorCode.NOT_FOUND, f"Source content directory does not exist: {resolved_source_dir}")
+
+    unreal = get_unreal_connection()
+    if not unreal:
+        return make_error_response(MCPErrorCode.CONNECTION_ERROR, "Failed to connect to Unreal Engine")
+
+    try:
+        response = unreal.send_command(
+            "copy_content_tree_from_disk",
+            {
+                "source_content_dir": resolved_source_dir,
+                "destination_path": destination_path,
+                "replace_existing": replace_existing,
+            },
+        )
+        return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
+    except Exception as e:
+        logger.error(f"copy_content_tree_from_disk error: {e}")
         return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
 
 

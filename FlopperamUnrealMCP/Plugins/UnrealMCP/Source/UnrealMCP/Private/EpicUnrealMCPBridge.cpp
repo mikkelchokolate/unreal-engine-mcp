@@ -396,6 +396,7 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const T
                      CommandType == TEXT("export_retargeted_animations") ||
                      CommandType == TEXT("validate_animation_export_config") ||
                      CommandType == TEXT("import_skeletal_mesh_asset") ||
+                     CommandType == TEXT("copy_content_tree_from_disk") ||
                      CommandType == TEXT("list_animation_assets") ||
                      CommandType == TEXT("spawn_blueprint_actor") ||
                      CommandType == TEXT("request_editor_exit") ||
@@ -590,6 +591,7 @@ TSharedPtr<FJsonObject> UEpicUnrealMCPBridge::DispatchToHandler(
              CommandType == TEXT("export_retargeted_animations") ||
              CommandType == TEXT("validate_animation_export_config") ||
              CommandType == TEXT("import_skeletal_mesh_asset") ||
+             CommandType == TEXT("copy_content_tree_from_disk") ||
              CommandType == TEXT("list_animation_assets") ||
              CommandType == TEXT("spawn_blueprint_actor") ||
              CommandType == TEXT("request_editor_exit") ||

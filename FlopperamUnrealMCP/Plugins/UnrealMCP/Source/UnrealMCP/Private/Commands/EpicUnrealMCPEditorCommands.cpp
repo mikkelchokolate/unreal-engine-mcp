@@ -24,8 +24,11 @@
 #include "EditorAssetLibrary.h"
 #include "AssetImportTask.h"
 #include "AssetToolsModule.h"
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "Commands/EpicUnrealMCPBlueprintCommands.h"
+#include "HAL/FileManager.h"
 #include "Misc/Paths.h"
+#include "Misc/PackageName.h"
 #include "HAL/PlatformProcess.h"
 #include "HAL/PlatformMisc.h"
 #include "UObject/UnrealType.h"
@@ -606,6 +609,7 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     else if (CommandType == TEXT("export_retargeted_animations")) { return HandleExportRetargetedAnimations(Params); }
     else if (CommandType == TEXT("validate_animation_export_config")) { return HandleValidateAnimationExportConfig(Params); }
     else if (CommandType == TEXT("import_skeletal_mesh_asset")) { return HandleImportSkeletalMeshAsset(Params); }
+    else if (CommandType == TEXT("copy_content_tree_from_disk")) { return HandleCopyContentTreeFromDisk(Params); }
     else if (CommandType == TEXT("list_animation_assets")) { return HandleListAnimationAssets(Params); }
     else if (CommandType == TEXT("spawn_blueprint_actor")) { return HandleSpawnBlueprintActor(Params); }
     // Editor lifecycle
@@ -1261,6 +1265,178 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleImportSkeletalMeshAs
     ResultObj->SetBoolField(TEXT("save_requested"), bSave);
     ResultObj->SetArrayField(TEXT("saved_asset_paths"), SavedAssetPaths);
     ResultObj->SetNumberField(TEXT("saved_asset_count"), SavedAssetPaths.Num());
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCopyContentTreeFromDisk(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SourceContentDir;
+    if (!Params.IsValid() || !Params->TryGetStringField(TEXT("source_content_dir"), SourceContentDir))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'source_content_dir' parameter"));
+    }
+
+    FString DestinationPath;
+    if (!Params->TryGetStringField(TEXT("destination_path"), DestinationPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'destination_path' parameter"));
+    }
+
+    bool bReplaceExisting = false;
+    Params->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
+
+    SourceContentDir = FPaths::ConvertRelativePathToFull(SourceContentDir);
+    FPaths::NormalizeFilename(SourceContentDir);
+    FPaths::NormalizeDirectoryName(SourceContentDir);
+    if (!SourceContentDir.EndsWith(TEXT("/")))
+    {
+        SourceContentDir += TEXT("/");
+    }
+
+    if (!IFileManager::Get().DirectoryExists(*SourceContentDir))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::NOT_FOUND,
+            FString::Printf(TEXT("Source content directory does not exist: %s"), *SourceContentDir));
+    }
+
+    DestinationPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+    while (DestinationPath.EndsWith(TEXT("/")) && DestinationPath.Len() > 5)
+    {
+        DestinationPath.LeftChopInline(1);
+    }
+
+    if (!DestinationPath.StartsWith(TEXT("/Game")) ||
+        (DestinationPath.Len() > 5 && !DestinationPath.StartsWith(TEXT("/Game/"))))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::INVALID_PARAM,
+            TEXT("destination_path must be an Unreal game content path such as /Game/Characters/Mannequins"));
+    }
+
+    FString DestinationPhysicalDir;
+    if (!FPackageName::TryConvertLongPackageNameToFilename(DestinationPath, DestinationPhysicalDir))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::INVALID_PARAM,
+            FString::Printf(TEXT("Could not convert destination_path to a content directory: %s"), *DestinationPath));
+    }
+    DestinationPhysicalDir = FPaths::ConvertRelativePathToFull(DestinationPhysicalDir);
+    FPaths::NormalizeFilename(DestinationPhysicalDir);
+    FPaths::NormalizeDirectoryName(DestinationPhysicalDir);
+
+    TArray<FString> SourceFiles;
+    IFileManager::Get().FindFilesRecursive(SourceFiles, *SourceContentDir, TEXT("*.*"), true, false);
+    SourceFiles.Sort();
+
+    TArray<TSharedPtr<FJsonValue>> CopiedFiles;
+    TArray<TSharedPtr<FJsonValue>> SkippedFiles;
+    TArray<TSharedPtr<FJsonValue>> FailedFiles;
+    TArray<FString> CopiedAssetPathStrings;
+
+    auto IsUnrealPackagePayload = [](const FString& FilePath) -> bool
+    {
+        const FString Extension = FPaths::GetExtension(FilePath).ToLower();
+        return Extension == TEXT("uasset") ||
+               Extension == TEXT("uexp") ||
+               Extension == TEXT("ubulk") ||
+               Extension == TEXT("uptnl");
+    };
+
+    for (const FString& SourceFile : SourceFiles)
+    {
+        if (!IsUnrealPackagePayload(SourceFile))
+        {
+            continue;
+        }
+
+        FString NormalizedSourceFile = SourceFile;
+        FPaths::NormalizeFilename(NormalizedSourceFile);
+        FString RelativePath = NormalizedSourceFile;
+        if (!FPaths::MakePathRelativeTo(RelativePath, *SourceContentDir))
+        {
+            FailedFiles.Add(MakeShared<FJsonValueString>(NormalizedSourceFile));
+            continue;
+        }
+        FPaths::NormalizeFilename(RelativePath);
+
+        const FString DestinationFile = FPaths::Combine(DestinationPhysicalDir, RelativePath);
+        if (IFileManager::Get().FileExists(*DestinationFile) && !bReplaceExisting)
+        {
+            SkippedFiles.Add(MakeShared<FJsonValueString>(DestinationFile));
+            continue;
+        }
+
+        IFileManager::Get().MakeDirectory(*FPaths::GetPath(DestinationFile), true);
+        const uint32 CopyResult = IFileManager::Get().Copy(*DestinationFile, *NormalizedSourceFile, bReplaceExisting, true);
+        if (CopyResult != COPY_OK)
+        {
+            FailedFiles.Add(MakeShared<FJsonValueString>(NormalizedSourceFile));
+            continue;
+        }
+
+        CopiedFiles.Add(MakeShared<FJsonValueString>(DestinationFile));
+
+        if (FPaths::GetExtension(RelativePath).Equals(TEXT("uasset"), ESearchCase::IgnoreCase))
+        {
+            const FString RelativePackageDir = FPaths::GetPath(RelativePath);
+            const FString RelativePackageName = FPaths::GetBaseFilename(RelativePath);
+            FString RelativePackagePath = RelativePackageDir.IsEmpty()
+                ? RelativePackageName
+                : FPaths::Combine(RelativePackageDir, RelativePackageName);
+            FPaths::NormalizeFilename(RelativePackagePath);
+            FString AssetPath = FPaths::Combine(DestinationPath, RelativePackagePath);
+            AssetPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+            CopiedAssetPathStrings.Add(AssetPath);
+        }
+    }
+
+    if (FailedFiles.Num() > 0)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::UNKNOWN_ERROR,
+            FString::Printf(TEXT("Failed to copy %d Unreal content file(s) from %s"), FailedFiles.Num(), *SourceContentDir));
+    }
+
+    FAssetRegistryModule& AssetRegistryModule = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry"));
+    TArray<FString> ScanPaths;
+    ScanPaths.Add(DestinationPath);
+    AssetRegistryModule.Get().ScanPathsSynchronous(ScanPaths, true);
+
+    TArray<TSharedPtr<FJsonValue>> CopiedAssetPaths;
+    TArray<TSharedPtr<FJsonValue>> LoadedAssetPaths;
+    TArray<TSharedPtr<FJsonValue>> FailedAssetPaths;
+    for (const FString& AssetPath : CopiedAssetPathStrings)
+    {
+        CopiedAssetPaths.Add(MakeShared<FJsonValueString>(AssetPath));
+        if (UEditorAssetLibrary::LoadAsset(AssetPath))
+        {
+            LoadedAssetPaths.Add(MakeShared<FJsonValueString>(AssetPath));
+        }
+        else
+        {
+            FailedAssetPaths.Add(MakeShared<FJsonValueString>(AssetPath));
+        }
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("source_content_dir"), SourceContentDir);
+    ResultObj->SetStringField(TEXT("destination_path"), DestinationPath);
+    ResultObj->SetStringField(TEXT("destination_physical_dir"), DestinationPhysicalDir);
+    ResultObj->SetBoolField(TEXT("replace_existing"), bReplaceExisting);
+    ResultObj->SetArrayField(TEXT("copied_files"), CopiedFiles);
+    ResultObj->SetArrayField(TEXT("skipped_files"), SkippedFiles);
+    ResultObj->SetArrayField(TEXT("copied_asset_paths"), CopiedAssetPaths);
+    ResultObj->SetArrayField(TEXT("loaded_asset_paths"), LoadedAssetPaths);
+    ResultObj->SetArrayField(TEXT("failed_asset_paths"), FailedAssetPaths);
+    ResultObj->SetNumberField(TEXT("copied_file_count"), CopiedFiles.Num());
+    ResultObj->SetNumberField(TEXT("skipped_file_count"), SkippedFiles.Num());
+    ResultObj->SetNumberField(TEXT("copied_asset_count"), CopiedAssetPaths.Num());
+    ResultObj->SetNumberField(TEXT("loaded_asset_count"), LoadedAssetPaths.Num());
+    ResultObj->SetNumberField(TEXT("failed_asset_count"), FailedAssetPaths.Num());
     return ResultObj;
 }
 
