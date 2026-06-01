@@ -121,7 +121,9 @@ class UnrealConnection:
         "import_skeletal_mesh_asset",
         "copy_content_tree_from_disk",
         "create_ik_retargeter_assets",
-        "ensure_animation_skeletons"
+        "ensure_animation_skeletons",
+        "create_reference_pose_animation_sequence",
+        "export_animation_sequences"
     }
     
     def __init__(self):
@@ -539,6 +541,112 @@ def export_retargeted_animations(config_path: str, script_path: str, args_json: 
         return execute_unreal_python(resolved_script_path, json.dumps(payload))
     except Exception as e:
         logger.error(f"export_retargeted_animations error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
+@mcp.tool()
+def export_animation_sequences(
+    animation_paths: List[str],
+    fbx_output_dir: str,
+    source_id: str,
+    clip_kind: str,
+    loop: bool,
+    replace_existing: bool = True,
+    write_metadata: bool = True,
+    export_preview_mesh: bool = False,
+    license_class: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Export existing AnimSequence assets directly to FBX and Sen clip metadata sidecars.
+
+    This is for project-owned animation assets that are already in the connected
+    Unreal project. It deliberately does not run IK retargeting.
+
+    Args:
+        animation_paths: Unreal AnimSequence package/object paths, such as /Game/Senko/Animations/SEN_Idle.
+        fbx_output_dir: Filesystem directory where FBX files should be written.
+        source_id: Sen manifest source id written to each sidecar.
+        clip_kind: Sen clip kind written to each sidecar.
+        loop: Sen loop flag written to each sidecar.
+        replace_existing: Whether existing FBX/metadata files may be overwritten.
+        write_metadata: Whether to write .sen_clip_metadata.json sidecars.
+        export_preview_mesh: Whether the FBX exporter should include the animation preview mesh.
+        license_class: Optional license class copied into the sidecar for diagnostics.
+    """
+    if not animation_paths:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'animation_paths' entries")
+    if not isinstance(animation_paths, list) or any(not isinstance(path, str) or not path for path in animation_paths):
+        return make_error_response(MCPErrorCode.INVALID_PARAM, "'animation_paths' must be a non-empty list of strings")
+    if not fbx_output_dir:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'fbx_output_dir' parameter")
+    if not source_id:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'source_id' parameter")
+    if not clip_kind:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'clip_kind' parameter")
+
+    unreal = get_unreal_connection()
+    if not unreal:
+        return make_error_response(MCPErrorCode.CONNECTION_ERROR, "Failed to connect to Unreal Engine")
+
+    try:
+        response = unreal.send_command(
+            "export_animation_sequences",
+            {
+                "animation_paths": animation_paths,
+                "fbx_output_dir": os.path.abspath(fbx_output_dir),
+                "source_id": source_id,
+                "clip_kind": clip_kind,
+                "loop": loop,
+                "replace_existing": replace_existing,
+                "write_metadata": write_metadata,
+                "export_preview_mesh": export_preview_mesh,
+                "license_class": license_class,
+            },
+        )
+        return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
+    except Exception as e:
+        logger.error(f"export_animation_sequences error: {e}")
+        return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
+
+
+@mcp.tool()
+def create_reference_pose_animation_sequence(
+    skeletal_mesh_path: str,
+    destination_path: str,
+    replace_existing: bool = False,
+    save: bool = True,
+) -> Dict[str, Any]:
+    """
+    Create a project-owned AnimSequence from a skeletal mesh reference pose.
+
+    Args:
+        skeletal_mesh_path: Unreal SkeletalMesh path, such as /Game/Senko/SK_Senko.
+        destination_path: Unreal AnimSequence asset path, such as /Game/Senko/Generated/SEN_OwnedIdle.
+        replace_existing: Whether an existing destination asset may be replaced.
+        save: Whether the created asset package should be saved.
+    """
+    if not skeletal_mesh_path:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'skeletal_mesh_path' parameter")
+    if not destination_path:
+        return make_error_response(MCPErrorCode.MISSING_PARAM, "Missing 'destination_path' parameter")
+
+    unreal = get_unreal_connection()
+    if not unreal:
+        return make_error_response(MCPErrorCode.CONNECTION_ERROR, "Failed to connect to Unreal Engine")
+
+    try:
+        response = unreal.send_command(
+            "create_reference_pose_animation_sequence",
+            {
+                "skeletal_mesh_path": skeletal_mesh_path,
+                "destination_path": destination_path,
+                "replace_existing": replace_existing,
+                "save": save,
+            },
+        )
+        return response or make_error_response(MCPErrorCode.TIMEOUT, "No response from Unreal")
+    except Exception as e:
+        logger.error(f"create_reference_pose_animation_sequence error: {e}")
         return make_error_response(MCPErrorCode.UNKNOWN_ERROR, str(e))
 
 

@@ -25,7 +25,9 @@
 #include "AssetImportTask.h"
 #include "AssetToolsModule.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetExportTask.h"
 #include "Animation/AnimationAsset.h"
+#include "Animation/AnimSequence.h"
 #include "Animation/Skeleton.h"
 #include "Engine/SkeletalMesh.h"
 #include "Commands/EpicUnrealMCPBlueprintCommands.h"
@@ -48,6 +50,10 @@
 #include "Factories/FbxImportUI.h"
 #include "Factories/FbxSkeletalMeshImportData.h"
 #include "Factories/SkeletonFactory.h"
+#include "Factories/AnimSequenceFactory.h"
+#include "Exporters/AnimSequenceExporterFBX.h"
+#include "Exporters/Exporter.h"
+#include "Exporters/FbxExportOption.h"
 #include "IAssetTools.h"
 #include "Modules/ModuleManager.h"
 // Phase 1: Editor lifecycle
@@ -620,6 +626,8 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCommand(const FStrin
     else if (CommandType == TEXT("set_actor_transform")) { return HandleSetActorTransform(Params); }
     else if (CommandType == TEXT("execute_unreal_python")) { return HandleExecuteUnrealPython(Params); }
     else if (CommandType == TEXT("export_retargeted_animations")) { return HandleExportRetargetedAnimations(Params); }
+    else if (CommandType == TEXT("create_reference_pose_animation_sequence")) { return HandleCreateReferencePoseAnimationSequence(Params); }
+    else if (CommandType == TEXT("export_animation_sequences")) { return HandleExportAnimationSequences(Params); }
     else if (CommandType == TEXT("validate_animation_export_config")) { return HandleValidateAnimationExportConfig(Params); }
     else if (CommandType == TEXT("import_skeletal_mesh_asset")) { return HandleImportSkeletalMeshAsset(Params); }
     else if (CommandType == TEXT("copy_content_tree_from_disk")) { return HandleCopyContentTreeFromDisk(Params); }
@@ -869,6 +877,354 @@ TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExportRetargetedAnim
     PythonParams->SetStringField(TEXT("script_path"), ScriptPath);
     PythonParams->SetStringField(TEXT("args_json"), ArgsJson);
     return HandleExecuteUnrealPython(PythonParams);
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleCreateReferencePoseAnimationSequence(const TSharedPtr<FJsonObject>& Params)
+{
+    FString SkeletalMeshPath;
+    if (!Params.IsValid() || (!Params->TryGetStringField(TEXT("skeletal_mesh_path"), SkeletalMeshPath) &&
+                              !Params->TryGetStringField(TEXT("skeletalMeshPath"), SkeletalMeshPath)))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'skeletal_mesh_path' parameter"));
+    }
+
+    FString DestinationPath;
+    if (!Params->TryGetStringField(TEXT("destination_path"), DestinationPath) &&
+        !Params->TryGetStringField(TEXT("destinationPath"), DestinationPath))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'destination_path' parameter"));
+    }
+
+    bool bReplaceExisting = false;
+    Params->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
+    Params->TryGetBoolField(TEXT("replaceExisting"), bReplaceExisting);
+
+    bool bSave = true;
+    Params->TryGetBoolField(TEXT("save"), bSave);
+
+    auto LoadAssetExpanded = [](FString AssetPath) -> UObject*
+    {
+        AssetPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+        UObject* Asset = UEditorAssetLibrary::LoadAsset(AssetPath);
+        if (!Asset && AssetPath.StartsWith(TEXT("/")) && !AssetPath.Contains(TEXT(".")))
+        {
+            const FString AssetName = FPaths::GetBaseFilename(AssetPath);
+            const FString ExpandedPath = FString::Printf(TEXT("%s.%s"), *AssetPath, *AssetName);
+            Asset = UEditorAssetLibrary::LoadAsset(ExpandedPath);
+        }
+        return Asset;
+    };
+
+    auto SplitGameAssetPath = [](FString RawPath, FString& OutPackagePath, FString& OutAssetName, FString& OutAssetPath, FString& OutObjectPath, FString& OutError) -> bool
+    {
+        RawPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+        FString AssetPath = RawPath;
+        if (RawPath.Contains(TEXT(".")))
+        {
+            RawPath.Split(TEXT("."), &AssetPath, nullptr, ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+        }
+        while (AssetPath.EndsWith(TEXT("/")) && AssetPath.Len() > 5)
+        {
+            AssetPath.LeftChopInline(1);
+        }
+        if (!AssetPath.StartsWith(TEXT("/Game/")))
+        {
+            OutError = FString::Printf(TEXT("Asset path must be under /Game: %s"), *RawPath);
+            return false;
+        }
+        OutAssetName = FPaths::GetBaseFilename(AssetPath);
+        OutPackagePath = FPaths::GetPath(AssetPath);
+        if (OutAssetName.IsEmpty() || OutPackagePath.IsEmpty())
+        {
+            OutError = FString::Printf(TEXT("Asset path must include a package and asset name: %s"), *RawPath);
+            return false;
+        }
+        OutAssetPath = AssetPath;
+        OutObjectPath = FString::Printf(TEXT("%s.%s"), *AssetPath, *OutAssetName);
+        return true;
+    };
+
+    USkeletalMesh* SkeletalMesh = Cast<USkeletalMesh>(LoadAssetExpanded(SkeletalMeshPath));
+    if (!SkeletalMesh)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::NOT_FOUND,
+            FString::Printf(TEXT("Could not load SkeletalMesh: %s"), *SkeletalMeshPath));
+    }
+
+    USkeleton* Skeleton = SkeletalMesh->GetSkeleton();
+    if (!Skeleton)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::INVALID_PARAM,
+            FString::Printf(TEXT("SkeletalMesh has no USkeleton. Run ensure_animation_skeletons first: %s"), *SkeletalMeshPath));
+    }
+
+    FString PackagePath;
+    FString AssetName;
+    FString AssetPath;
+    FString ObjectPath;
+    FString PathError;
+    if (!SplitGameAssetPath(DestinationPath, PackagePath, AssetName, AssetPath, ObjectPath, PathError))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(MCPErrorCodes::INVALID_PARAM, PathError);
+    }
+
+    if (UEditorAssetLibrary::DoesAssetExist(AssetPath))
+    {
+        if (!bReplaceExisting)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::INVALID_PARAM,
+                FString::Printf(TEXT("AnimSequence already exists and replace_existing is false: %s"), *AssetPath));
+        }
+        if (!UEditorAssetLibrary::DeleteAsset(AssetPath))
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::UNKNOWN_ERROR,
+                FString::Printf(TEXT("Failed to delete existing AnimSequence: %s"), *AssetPath));
+        }
+    }
+
+    UEditorAssetLibrary::MakeDirectory(PackagePath);
+
+    UAnimSequenceFactory* Factory = NewObject<UAnimSequenceFactory>();
+    Factory->TargetSkeleton = Skeleton;
+    Factory->PreviewSkeletalMesh = SkeletalMesh;
+
+    FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>(TEXT("AssetTools"));
+    UObject* CreatedAsset = AssetToolsModule.Get().CreateAsset(
+        AssetName,
+        PackagePath,
+        UAnimSequence::StaticClass(),
+        Factory);
+
+    UAnimSequence* AnimSequence = Cast<UAnimSequence>(CreatedAsset);
+    if (!AnimSequence)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::UNKNOWN_ERROR,
+            FString::Printf(TEXT("Failed to create AnimSequence asset: %s"), *AssetPath));
+    }
+
+    AnimSequence->SetSkeleton(Skeleton);
+    AnimSequence->SetPreviewMesh(SkeletalMesh);
+    if (!AnimSequence->CreateAnimation(SkeletalMesh))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::UNKNOWN_ERROR,
+            FString::Printf(TEXT("Failed to populate AnimSequence from reference pose: %s"), *AssetPath));
+    }
+
+    AnimSequence->MarkPackageDirty();
+    AnimSequence->PostEditChange();
+    const bool bSaved = bSave ? UEditorAssetLibrary::SaveLoadedAsset(AnimSequence, false) : false;
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("skeletal_mesh_path"), SkeletalMesh->GetPathName());
+    ResultObj->SetStringField(TEXT("skeleton_path"), Skeleton->GetPathName());
+    ResultObj->SetStringField(TEXT("animation_path"), AnimSequence->GetPathName());
+    ResultObj->SetStringField(TEXT("package_path"), AssetPath);
+    ResultObj->SetBoolField(TEXT("replace_existing"), bReplaceExisting);
+    ResultObj->SetBoolField(TEXT("saved"), bSaved);
+    return ResultObj;
+}
+
+TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExportAnimationSequences(const TSharedPtr<FJsonObject>& Params)
+{
+    if (!Params.IsValid())
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing params object"));
+    }
+
+    const TArray<TSharedPtr<FJsonValue>>* AnimationPathValues = nullptr;
+    if (!Params->TryGetArrayField(TEXT("animation_paths"), AnimationPathValues) || !AnimationPathValues || AnimationPathValues->Num() == 0)
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'animation_paths' entries"));
+    }
+
+    FString FbxOutputDir;
+    if (!Params->TryGetStringField(TEXT("fbx_output_dir"), FbxOutputDir) &&
+        !Params->TryGetStringField(TEXT("fbxOutputDir"), FbxOutputDir))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'fbx_output_dir' parameter"));
+    }
+
+    FString SourceId;
+    if (!Params->TryGetStringField(TEXT("source_id"), SourceId) &&
+        !Params->TryGetStringField(TEXT("sourceId"), SourceId))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'source_id' parameter"));
+    }
+
+    FString ClipKind;
+    if (!Params->TryGetStringField(TEXT("clip_kind"), ClipKind) &&
+        !Params->TryGetStringField(TEXT("clipKind"), ClipKind))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'clip_kind' parameter"));
+    }
+
+    bool bLoop = false;
+    if (!Params->TryGetBoolField(TEXT("loop"), bLoop))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::MISSING_PARAM, TEXT("Missing 'loop' parameter"));
+    }
+
+    bool bReplaceExisting = true;
+    Params->TryGetBoolField(TEXT("replace_existing"), bReplaceExisting);
+    Params->TryGetBoolField(TEXT("overwrite"), bReplaceExisting);
+
+    bool bWriteMetadata = true;
+    Params->TryGetBoolField(TEXT("write_metadata"), bWriteMetadata);
+
+    bool bExportPreviewMesh = false;
+    Params->TryGetBoolField(TEXT("export_preview_mesh"), bExportPreviewMesh);
+
+    FString LicenseClass;
+    Params->TryGetStringField(TEXT("license_class"), LicenseClass);
+    Params->TryGetStringField(TEXT("licenseClass"), LicenseClass);
+
+    FString AbsoluteOutputDir = FPaths::ConvertRelativePathToFull(FbxOutputDir);
+    FPaths::NormalizeFilename(AbsoluteOutputDir);
+    if (!IFileManager::Get().MakeDirectory(*AbsoluteOutputDir, true))
+    {
+        return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+            MCPErrorCodes::UNKNOWN_ERROR,
+            FString::Printf(TEXT("Failed to create FBX output directory: %s"), *AbsoluteOutputDir));
+    }
+
+    auto LoadAnimSequence = [](const FString& RawPath) -> UAnimSequence*
+    {
+        UObject* Asset = UEditorAssetLibrary::LoadAsset(RawPath);
+        if (!Asset && RawPath.StartsWith(TEXT("/")) && !RawPath.Contains(TEXT(".")))
+        {
+            const FString AssetName = FPaths::GetBaseFilename(RawPath);
+            const FString ExpandedPath = FString::Printf(TEXT("%s.%s"), *RawPath, *AssetName);
+            Asset = LoadObject<UObject>(nullptr, *ExpandedPath);
+        }
+        return Cast<UAnimSequence>(Asset);
+    };
+
+    TArray<TSharedPtr<FJsonValue>> Exported;
+    for (const TSharedPtr<FJsonValue>& PathValue : *AnimationPathValues)
+    {
+        if (!PathValue.IsValid() || PathValue->Type != EJson::String)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::INVALID_PARAM, TEXT("Each 'animation_paths' entry must be a string"));
+        }
+
+        const FString AnimationPath = PathValue->AsString();
+        UAnimSequence* AnimSequence = LoadAnimSequence(AnimationPath);
+        if (!AnimSequence)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::NOT_FOUND,
+                FString::Printf(TEXT("Could not load AnimSequence: %s"), *AnimationPath));
+        }
+
+        const FString ClipId = AnimSequence->GetName();
+        const FString FbxPath = FPaths::Combine(AbsoluteOutputDir, FString::Printf(TEXT("%s.fbx"), *ClipId));
+        if (IFileManager::Get().FileExists(*FbxPath) && !bReplaceExisting)
+        {
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::INVALID_PARAM,
+                FString::Printf(TEXT("FBX already exists and replace_existing is false: %s"), *FbxPath));
+        }
+
+        UAssetExportTask* ExportTask = NewObject<UAssetExportTask>();
+        ExportTask->Object = AnimSequence;
+        ExportTask->Filename = FbxPath;
+        ExportTask->bAutomated = true;
+        ExportTask->bPrompt = false;
+        ExportTask->bReplaceIdentical = bReplaceExisting;
+        ExportTask->bSelected = false;
+        ExportTask->bUseFileArchive = false;
+        ExportTask->bWriteEmptyFiles = false;
+        ExportTask->Exporter = NewObject<UAnimSequenceExporterFBX>();
+
+        UFbxExportOption* ExportOptions = NewObject<UFbxExportOption>();
+        ExportOptions->bASCII = false;
+        ExportOptions->Collision = false;
+        ExportOptions->bExportPreviewMesh = bExportPreviewMesh;
+        ExportOptions->bExportSourceMesh = false;
+        ExportOptions->bForceFrontXAxis = false;
+        ExportTask->Options = ExportOptions;
+
+        if (!UExporter::RunAssetExportTask(ExportTask))
+        {
+            const FString ExportErrors = ExportTask->Errors.Num() > 0
+                ? FString::Join(ExportTask->Errors, TEXT("; "))
+                : TEXT("unknown exporter error");
+            return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                MCPErrorCodes::UNKNOWN_ERROR,
+                FString::Printf(TEXT("FBX export failed for %s: %s"), *AnimationPath, *ExportErrors));
+        }
+
+        FString MetadataPath;
+        if (bWriteMetadata)
+        {
+            const FString MetadataFileName = FString::Printf(TEXT("%s.%s"), *ClipId, TEXT("sen_clip_metadata.json"));
+            MetadataPath = FPaths::Combine(AbsoluteOutputDir, MetadataFileName);
+            if (IFileManager::Get().FileExists(*MetadataPath) && !bReplaceExisting)
+            {
+                return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                    MCPErrorCodes::INVALID_PARAM,
+                    FString::Printf(TEXT("Metadata already exists and replace_existing is false: %s"), *MetadataPath));
+            }
+
+            TSharedPtr<FJsonObject> MetadataObj = MakeShared<FJsonObject>();
+            MetadataObj->SetStringField(TEXT("clipId"), ClipId);
+            MetadataObj->SetStringField(TEXT("sourceId"), SourceId);
+            MetadataObj->SetStringField(TEXT("kind"), ClipKind);
+            MetadataObj->SetBoolField(TEXT("loop"), bLoop);
+            if (!LicenseClass.IsEmpty())
+            {
+                MetadataObj->SetStringField(TEXT("licenseClass"), LicenseClass);
+            }
+
+            FString MetadataJson;
+            TSharedRef<TJsonWriter<>> MetadataWriter = TJsonWriterFactory<>::Create(&MetadataJson);
+            FJsonSerializer::Serialize(MetadataObj.ToSharedRef(), MetadataWriter);
+            MetadataJson += LINE_TERMINATOR;
+            if (!FFileHelper::SaveStringToFile(MetadataJson, *MetadataPath))
+            {
+                return FEpicUnrealMCPCommonUtils::CreateErrorResponse(
+                    MCPErrorCodes::UNKNOWN_ERROR,
+                    FString::Printf(TEXT("Failed to write Sen clip metadata sidecar: %s"), *MetadataPath));
+            }
+        }
+
+        TSharedPtr<FJsonObject> ExportObj = MakeShared<FJsonObject>();
+        ExportObj->SetStringField(TEXT("animation_path"), AnimSequence->GetPathName());
+        ExportObj->SetStringField(TEXT("clip_id"), ClipId);
+        ExportObj->SetStringField(TEXT("fbx_path"), FbxPath);
+        if (!MetadataPath.IsEmpty())
+        {
+            ExportObj->SetStringField(TEXT("metadata_path"), MetadataPath);
+        }
+        Exported.Add(MakeShared<FJsonValueObject>(ExportObj));
+    }
+
+    TSharedPtr<FJsonObject> ResultObj = MakeShared<FJsonObject>();
+    ResultObj->SetBoolField(TEXT("success"), true);
+    ResultObj->SetStringField(TEXT("fbx_output_dir"), AbsoluteOutputDir);
+    ResultObj->SetStringField(TEXT("source_id"), SourceId);
+    ResultObj->SetStringField(TEXT("clip_kind"), ClipKind);
+    ResultObj->SetBoolField(TEXT("loop"), bLoop);
+    ResultObj->SetBoolField(TEXT("write_metadata"), bWriteMetadata);
+    ResultObj->SetArrayField(TEXT("exported"), Exported);
+    ResultObj->SetNumberField(TEXT("count"), Exported.Num());
+    return ResultObj;
 }
 
 TSharedPtr<FJsonObject> FEpicUnrealMCPEditorCommands::HandleExecuteUnrealPython(const TSharedPtr<FJsonObject>& Params)

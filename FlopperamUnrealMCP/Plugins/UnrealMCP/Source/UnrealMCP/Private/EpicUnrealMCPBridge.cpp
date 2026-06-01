@@ -394,6 +394,8 @@ FString UEpicUnrealMCPBridge::ExecuteCommand(const FString& CommandType, const T
                      CommandType == TEXT("set_actor_transform") ||
                      CommandType == TEXT("execute_unreal_python") ||
                      CommandType == TEXT("export_retargeted_animations") ||
+                     CommandType == TEXT("create_reference_pose_animation_sequence") ||
+                     CommandType == TEXT("export_animation_sequences") ||
                      CommandType == TEXT("validate_animation_export_config") ||
                      CommandType == TEXT("import_skeletal_mesh_asset") ||
                      CommandType == TEXT("copy_content_tree_from_disk") ||
@@ -591,6 +593,8 @@ TSharedPtr<FJsonObject> UEpicUnrealMCPBridge::DispatchToHandler(
              CommandType == TEXT("set_actor_transform") ||
              CommandType == TEXT("execute_unreal_python") ||
              CommandType == TEXT("export_retargeted_animations") ||
+             CommandType == TEXT("create_reference_pose_animation_sequence") ||
+             CommandType == TEXT("export_animation_sequences") ||
              CommandType == TEXT("validate_animation_export_config") ||
              CommandType == TEXT("import_skeletal_mesh_asset") ||
              CommandType == TEXT("copy_content_tree_from_disk") ||

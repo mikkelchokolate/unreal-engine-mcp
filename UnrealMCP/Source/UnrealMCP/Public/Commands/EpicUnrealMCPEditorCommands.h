@@ -25,6 +25,8 @@ private:
     TSharedPtr<FJsonObject> HandleSetActorTransform(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleExecuteUnrealPython(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleExportRetargetedAnimations(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleCreateReferencePoseAnimationSequence(const TSharedPtr<FJsonObject>& Params);
+    TSharedPtr<FJsonObject> HandleExportAnimationSequences(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleValidateAnimationExportConfig(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleImportSkeletalMeshAsset(const TSharedPtr<FJsonObject>& Params);
     TSharedPtr<FJsonObject> HandleCopyContentTreeFromDisk(const TSharedPtr<FJsonObject>& Params);
